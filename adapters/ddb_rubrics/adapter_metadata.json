@@ -1,0 +1,29 @@
+[
+  {
+    "adapter_name": "ddb-rubrics",
+    "adapter_builders": [
+      "Chengrui Ma (chengrui.ma.27@dartmouth.edu)"
+    ],
+    "original_benchmark": [
+      {
+        "split": "test",
+        "size": 101,
+        "harness": "agent",
+        "supported_agents": [],
+        "adaptable": true,
+        "notes": "WebGen-Bench evaluates generated interactive websites with WebVoyager and a VLM judge."
+      }
+    ],
+    "harbor_adapter": [
+      {
+        "split": "test",
+        "adapted_benchmark_size": 101,
+        "registry_benchmark_size": 101,
+        "added_agents": [
+          "ddb"
+        ],
+        "notes": "Harbor verification uses WebVoyager (Selenium + VLM) identical to the original benchmark. VLM_STATIC_EVAL selects trajectory, vlm, or both reward modes. The VLM endpoint is configured with VLM_API_KEY / VLM_API_BASE_URL / VLM_MODEL. VLM scoring follows compute_acc.py: YES=1.0, PARTIAL=0.5, NO=0.0, averaged over all ui_instruct tasks."
+      }
+    ]
+  }
+]

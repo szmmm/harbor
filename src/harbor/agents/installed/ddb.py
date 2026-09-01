@@ -81,6 +81,7 @@ DEFAULT_CALLBACK_PORT = 8977
 # Neutral sandbox paths where the agent publishes what DDB produced.
 PREVIEW_URL_SANDBOX_PATH = "/tmp/harbor_preview_url"
 SOURCE_CODES_SANDBOX_PATH = "/tmp/DDB_App_source_codes.txt"
+TRAJECTORY_SANDBOX_PATH = "/tmp/harbor_trajectory.json"
 WORKSPACE_SANDBOX_PATH = "/app/workspace"
 WORKSPACE_EXCLUDE_PATTERN = r"^\.git/|^node_modules/|^dist/|^tool_call_logs/"
 
@@ -720,10 +721,23 @@ class DDB(BaseAgent):
                         "ddb_app_id": app_id,
                         "ddb_base_url": self._base_url,
                         "ddb_callback_url": listener.advertised_url,
+                        "proxy_session_id": session_id,
                     }
                     self.logger.debug(f"Submitted DDB task {task_id} (app {app_id}); awaiting webhook at {listener.advertised_url}")
 
                     task = await self.wait_for_webhook(client, listener, task_id)
+                    # Preserve the complete diagnostic response before validation.
+                    (self.logs_dir / "task.json").write_text(json.dumps(task, indent=4, ensure_ascii=False))
+
+                    result = task.get("result")
+                    success = result.get("success") if isinstance(result, dict) else False
+                    if not success:
+                        error = result.get("error") if isinstance(result, dict) else ""
+                        status = task.get("status")
+                        raise RuntimeError(
+                            f"DDB task {task.get('task_id')} did not succeed: "
+                            f"status={status!r}, result.success={success!r}, error={error}"
+                        )
                 except BaseException:
                     # Leaving without a terminal webhook: cancelled (harbor's
                     # surplus early-stop via ``Job.cancel_trials_for_task``, or
@@ -731,14 +745,12 @@ class DDB(BaseAgent):
                     # not stop because we stopped listening -- it keeps building.
                     await self._abandon(task_id, session_id)
                     raise
-                (self.logs_dir / "task.json").write_text(json.dumps(task, indent=4, ensure_ascii=False))
 
                 # For RL training, we fetch token IDs and logprobs from the proxy server
                 if self.training:
                     proxy_url = self.proxy_url
                     if proxy_url is None or session_id is None:
                         raise RuntimeError("training=True requires proxy_url (the rollout proxy recording token IDs and logprobs).")
-                    context.metadata["proxy_session_id"] = session_id
                     try:
                         record = await self._get_session(proxy_url, session_id)
                         if record is None:
@@ -757,6 +769,27 @@ class DDB(BaseAgent):
                     trajectories: dict[str, Any] = {} # dummy
         finally:
             await _release_listener()
+
+        # Publish complete training trajectories before the verifier starts.
+        # This is independent of preview URL publication.
+        if self.training:
+            trajectory_file = self.logs_dir / "trajectory.json"
+            trajectory_file.write_text(
+                json.dumps(
+                    {"schema_version": 1, "trajectories": trajectories},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            await environment.upload_file(
+                trajectory_file,
+                TRAJECTORY_SANDBOX_PATH,
+            )
+            self.logger.debug(
+                f"Published DDB trajectories to sandbox {TRAJECTORY_SANDBOX_PATH}"
+            )
 
         # Auto-inject DDB's preview URL so a URL-based verifier can target the remote app.
         if self._publish_preview_url:

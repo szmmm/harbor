@@ -1,0 +1,33 @@
+job_name: ddb-rubrics-ddb
+jobs_dir: jobs
+n_attempts: 1
+n_concurrent_trials: 1
+quiet: false
+
+environment:
+  type: docker
+  force_build: true
+  delete: true
+
+agents:
+  - name: ddb
+    kwargs:
+      training: true
+    env:
+      DDB_BASE_URL: ${DDB_BASE_URL}
+      DDB_API_KEY: ${DDB_API_KEY}
+      DDB_PROXY_URL: ${DDB_PROXY_URL}
+      DDB_PREVIEW_BASE_URL: ${DDB_PREVIEW_BASE_URL:-}
+      DDB_CALLBACK_URL: ${DDB_CALLBACK_URL:-}
+
+verifier:
+  env:
+    DDB_TRAJECTORY_AGENT: ${DDB_TRAJECTORY_AGENT:-ddt-agent}
+    TRAJECTORY_SCORE_TYPE: ${TRAJECTORY_SCORE_TYPE:-validation_rubric}
+    VLM_STATIC_EVAL: ${VLM_STATIC_EVAL:-trajectory}
+    VLM_API_KEY: ${VLM_API_KEY:-}
+    VLM_API_BASE_URL: ${VLM_API_BASE_URL:-}
+    VLM_MODEL: ${VLM_MODEL:-Qwen/Qwen2.5-VL-32B-Instruct}
+
+datasets:
+  - path: datasets/ddb-rubrics

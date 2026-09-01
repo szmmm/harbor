@@ -186,6 +186,8 @@ class Job:
         task = self._trial_tasks.get(trial_name)
         if task is None or task.done() or task.cancelling():
             return False
+        if task is asyncio.current_task():
+            return False
         return task.cancel()
 
     def cancel_trials_for_task(self, task_name: str) -> list[str]:

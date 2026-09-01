@@ -1,0 +1,23 @@
+[project]
+name = "harbor-ddb-rubrics-adapter"
+version = "0.1.0"
+description = "Harbor adapter for the WebGen-Bench benchmark."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.4.1",
+    "harbor",
+]
+
+[project.scripts]
+ddb-rubrics = "ddb_rubrics.main:main"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ddb_rubrics"
+
+[tool.uv.sources]
+harbor = { path = "../..", editable = true }
