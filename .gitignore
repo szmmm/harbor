@@ -244,6 +244,7 @@ utils/harbor_ddb/webgen-bench
 utils/harbor_ddb/ddb-bench
 utils/harbor-rollout/webgen-bench
 utils/harbor-rollout/ddb-bench
+utils/harbor-rollout/ddb-rubrics*
 utils/harbor-rollout/jobs
 utils/harbor-rollout/records
 utils/harbor-rollout/test_rollout.out

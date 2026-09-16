@@ -49,6 +49,7 @@ from harbor.environments.docker.compose_env import (
 )
 from harbor.environments.docker.utils import (
     default_docker_platform,
+    docker_image_exists,
     ensure_docker_image_built,
 )
 from harbor.models.environment_type import EnvironmentType
@@ -882,13 +883,24 @@ class DockerEnvironment(BaseEnvironment):
             await self._ensure_egress_control_sidecar_image_built()
 
         if not self._use_prebuilt:
-            # Serialize image builds: if multiple environments with the same image name
-            # start concurrently, only one builds while others wait for the cached image.
-            lock = self._image_build_locks.setdefault(
-                self.environment_name, asyncio.Lock()
-            )
-            async with lock:
-                await self._run_docker_compose_command(["build"])
+            # The compose service is tagged with _main_image_name. Check before and
+            # after taking the lock so concurrent trials build identical content once.
+            image_exists = await docker_image_exists(self._main_image_name)
+            if force_build or not image_exists:
+                lock = self._image_build_locks.setdefault(
+                    self._main_image_name, asyncio.Lock()
+                )
+                async with lock:
+                    image_exists = await docker_image_exists(self._main_image_name)
+                    if force_build or not image_exists:
+                        await self._run_docker_compose_command(["build"])
+                    else:
+                        self.logger.debug(
+                            "Reusing Docker image %s built by another trial",
+                            self._main_image_name,
+                        )
+            else:
+                self.logger.debug("Reusing Docker image %s", self._main_image_name)
 
         # Validate image OS after build/pull but before container start.
         image_to_check = (
@@ -905,7 +917,10 @@ class DockerEnvironment(BaseEnvironment):
         except RuntimeError:
             pass
 
-        await self._run_docker_compose_command(["up", "--detach", "--wait"])
+        # Build resolution is complete above. Do not let `up` invoke a second build.
+        await self._run_docker_compose_command(
+            ["up", "--detach", "--wait", "--no-build"]
+        )
 
         # Auto-create + chmod each writable mount target inside the container.  Bind
         # mounts auto-create the target as part of the mount, so mkdir is
