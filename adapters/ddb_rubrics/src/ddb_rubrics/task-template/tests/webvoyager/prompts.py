@@ -61,6 +61,7 @@ Key Guidelines You MUST follow:
 4) STRICTLY Avoid repeating the same action if the webpage remains unchanged. You may have selected the wrong web element or numerical label. Continuous use of the Wait is also NOT allowed.
 5) When a complex Task involves multiple questions or steps, select "ANSWER" only at the very end, after addressing all of these questions (steps). Flexibly combine your own abilities with the information in the web page. Double check the formatting requirements in the task when ANSWER.
 * Web Browsing Guidelines *
+IMPORTANT: If a produced-app link opens the main DeepDiver sign-in or registration page, the actor wrote a broken path. Do not click "Request access" or submit a DeepDiver form.
 1) Don't interact with useless web elements like Login, Sign-in, donation that appear in Webpages. Pay attention to Key Web Elements like search textbox and menu.
 2) Vsit video websites like YouTube is allowed BUT you can't play videos. Clicking to download PDF is allowed and will be analyzed by the Assistant API.
 3) Focus on the date in task, you must look for results that match the date. It may be necessary to find the correct year, month and day at calendar.

@@ -62,7 +62,7 @@ Instructions:
 - Attempt the task as a user would, using the UI elements available.
 - Make multiple attempts if needed to try and achieve the expected result.
 - Observe whether the expected result is fully, partially, or not at all achieved.
-- IMPORTANT: You can at most interact with the website 15 times. If the limit is reached, directly output your answer.
+- IMPORTANT: You can at most interact with the website 25 times. If the limit is reached, directly output your answer.
 
 At the end of your testing, answer only with one of the following:
 - YES: if the expected result was fully achieved.
@@ -271,7 +271,7 @@ def run_webvoyager(tasks_file: Path) -> None:
         api_model,
         "--headless",
         "--max_iter",
-        "15",
+        "25",
         "--max_attached_imgs",
         "3",
         "--temperature",

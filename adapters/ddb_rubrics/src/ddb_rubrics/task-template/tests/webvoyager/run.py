@@ -8,6 +8,7 @@ import shutil
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, Any, List
+from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -82,6 +83,97 @@ def driver_config(args: argparse.Namespace) -> webdriver.ChromeOptions:
         },
     )
     return options
+
+
+def install_preview_guard(driver_task, entry_url: str):
+    """Block navigation out of a DDB preview URL."""
+    entry = urlsplit(entry_url)
+    if not re.fullmatch(r"/preview/[^/]+/", entry.path) or not entry.query:
+        return None
+
+    script = f"""
+        (() => {{
+            const entry = new URL({json.dumps(entry_url)});
+            const escapes = (value) => {{
+                const next = new URL(value, location.href);
+                return next.origin !== entry.origin ||
+                    next.pathname !== entry.pathname ||
+                    next.search !== entry.search;
+            }};
+            const block = (value) => {{
+                if (!escapes(value)) return false;
+                const next = new URL(value, location.href);
+                window.__harborPreviewEscape = next.pathname;
+                return true;
+            }};
+            for (const method of ['pushState', 'replaceState']) {{
+                const original = history[method].bind(history);
+                history[method] = (state, unused, url) =>
+                    url != null && block(url) ? undefined : original(state, unused, url);
+            }}
+            document.addEventListener('click', (event) => {{
+                const anchor = event.target.closest?.('a[href]');
+                if (anchor && block(anchor.href)) {{
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }}
+            }}, true);
+            document.addEventListener('submit', (event) => {{
+                if (block(event.target.action)) {{
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }}
+            }}, true);
+            const originalOpen = window.open.bind(window);
+            window.open = (url, ...args) =>
+                url != null && block(url) ? null : originalOpen(url, ...args);
+        }})();
+    """
+    driver_task.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument", {"source": script}
+    )
+    return entry
+
+
+def preview_escape(driver_task, entry):
+    """Return the escaped location, or None while the preview scope is intact."""
+    if entry is None:
+        return None
+    attempted_path = driver_task.execute_script(
+        "return window.__harborPreviewEscape || null"
+    )
+    current_url = driver_task.current_url
+    current = urlsplit(current_url)
+    if attempted_path:
+        return attempted_path
+    if (current.scheme, current.netloc, current.path, current.query) != (
+        entry.scheme,
+        entry.netloc,
+        entry.path,
+        entry.query,
+    ):
+        return current_url
+    return None
+
+
+def stop_on_preview_escape(driver_task, entry, messages):
+    """Stop the actor before it can interact with a page outside the preview."""
+    escaped_url = preview_escape(driver_task, entry)
+    if not escaped_url:
+        return False
+    logging.error("Actor routing error: preview navigation escaped to %s", escaped_url)
+    messages.append(
+        {
+            "role": "assistant",
+            "content": (
+                "Thought: The actor used the wrong router or path and "
+                "tried to leave the DDB preview. "
+                "Action: ANSWER; [NO]"
+            ),
+        }
+    )
+    driver_task.get("about:blank")
+    return True
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -346,6 +438,7 @@ def run_single_task(task: Dict[str, Any], args_dict: Dict[str, Any]):
     options = driver_config(args)
     driver_task = webdriver.Chrome(options=options)
     driver_task.set_window_size(args.window_width, args.window_height)
+    preview_entry = install_preview_guard(driver_task, task["web"])
 
     try:
         driver_task.get(task["web"])
@@ -399,6 +492,9 @@ def run_single_task(task: Dict[str, Any], args_dict: Dict[str, Any]):
     accumulate_completion_token = 0
 
     while it < args.max_iter:
+        if stop_on_preview_escape(driver_task, preview_entry, messages):
+            break
+
         logging.info("Iter: %s", it)
         it += 1
 
@@ -581,6 +677,9 @@ def run_single_task(task: Dict[str, Any], args_dict: Dict[str, Any]):
 
             else:
                 raise NotImplementedError(f"Unknown action {action_key}")
+
+            if stop_on_preview_escape(driver_task, preview_entry, messages):
+                break
 
         except Exception as e:  # pylint: disable=broad-except
             logging.error("Driver error info: %s", e)

@@ -269,7 +269,7 @@ def run_webvoyager(tasks_file: Path) -> None:
         "--max_attached_imgs",
         "3",
         "--temperature",
-        "1",
+        "0",
         "--fix_box_color",
         "--seed",
         "42",
@@ -279,6 +279,8 @@ def run_webvoyager(tasks_file: Path) -> None:
         str(downloads_dir),
         "--num_workers",
         "8",
+        "--window_width", "1024",
+        "--window_height", "1000",
     ]
     if api_base_url:
         cmd += ["--api_base_url", api_base_url]

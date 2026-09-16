@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from harbor.environments.base import ExecResult
 from harbor.environments.docker import (
@@ -805,7 +806,7 @@ class TestStartStaleContainerCleanup:
 
         assert calls[:2] == [
             ["down", "--remove-orphans"],
-            ["up", "--detach", "--wait"],
+            ["up", "--detach", "--wait", "--no-build"],
         ]
 
     async def test_start_with_build_runs_down_before_up(self, docker_env):
@@ -818,12 +819,56 @@ class TestStartStaleContainerCleanup:
 
         docker_env._run_docker_compose_command = AsyncMock(side_effect=track_calls)
 
-        await docker_env.start(force_build=True)
+        with patch(
+            "harbor.environments.docker.docker.docker_image_exists",
+            new=AsyncMock(return_value=False),
+        ):
+            await docker_env.start(force_build=True)
 
         assert calls[:3] == [
             ["build"],
             ["down", "--remove-orphans"],
-            ["up", "--detach", "--wait"],
+            ["up", "--detach", "--wait", "--no-build"],
+        ]
+
+    async def test_start_reuses_existing_content_addressed_image(self, docker_env):
+        """An existing content-addressed image must skip compose build."""
+        docker_env.task_env_config.docker_image = None
+        docker_env._run_docker_compose_command = AsyncMock(
+            return_value=ExecResult(return_code=0)
+        )
+        image_exists = AsyncMock(return_value=True)
+
+        with patch(
+            "harbor.environments.docker.docker.docker_image_exists",
+            new=image_exists,
+        ):
+            await docker_env.start(force_build=False)
+
+        image_exists.assert_awaited_once_with(docker_env._main_image_name)
+        assert ["build"] not in [
+            call.args[0]
+            for call in docker_env._run_docker_compose_command.await_args_list
+        ]
+
+    async def test_start_rechecks_image_after_taking_build_lock(self, docker_env):
+        """A waiting trial must reuse the image produced by the lock holder."""
+        docker_env.task_env_config.docker_image = None
+        docker_env._run_docker_compose_command = AsyncMock(
+            return_value=ExecResult(return_code=0)
+        )
+        image_exists = AsyncMock(side_effect=[False, True])
+
+        with patch(
+            "harbor.environments.docker.docker.docker_image_exists",
+            new=image_exists,
+        ):
+            await docker_env.start(force_build=False)
+
+        assert image_exists.await_count == 2
+        assert ["build"] not in [
+            call.args[0]
+            for call in docker_env._run_docker_compose_command.await_args_list
         ]
 
     async def test_start_proceeds_when_down_fails(self, docker_env):
@@ -842,14 +887,14 @@ class TestStartStaleContainerCleanup:
 
         assert calls[:2] == [
             ["down", "--remove-orphans"],
-            ["up", "--detach", "--wait"],
+            ["up", "--detach", "--wait", "--no-build"],
         ]
 
     async def test_start_propagates_up_failure(self, docker_env):
         """start() should propagate errors from 'up -d'."""
 
         async def track_calls(command, **kwargs):
-            if command == ["up", "--detach", "--wait"]:
+            if command == ["up", "--detach", "--wait", "--no-build"]:
                 raise RuntimeError("Container creation failed")
             return ExecResult(return_code=0)
 
@@ -857,6 +902,13 @@ class TestStartStaleContainerCleanup:
 
         with pytest.raises(RuntimeError, match="Container creation failed"):
             await docker_env.start(force_build=False)
+
+
+def test_build_compose_tags_main_service_with_content_addressed_image():
+    """Compose must use the stable image name supplied by DockerEnvironment."""
+    compose = yaml.safe_load(DockerEnvironment._DOCKER_COMPOSE_BUILD_PATH.read_text())
+
+    assert compose["services"]["main"]["image"] == "${MAIN_IMAGE_NAME}"
 
 
 class TestStopChownBindMounts:
