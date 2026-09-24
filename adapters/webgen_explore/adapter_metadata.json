@@ -1,0 +1,29 @@
+[
+  {
+    "adapter_name": "webgen-explore",
+    "adapter_builders": [
+      "Chengrui Ma (chengrui.ma.27@dartmouth.edu)"
+    ],
+    "original_benchmark": [
+      {
+        "split": "test",
+        "size": 101,
+        "harness": "agent",
+        "supported_agents": [],
+        "adaptable": true,
+        "notes": "Compare the original WebGen-Bench UI tasks and evaluator with a browser judge grounded in the application request."
+      }
+    ],
+    "harbor_adapter": [
+      {
+        "split": "test",
+        "adapted_benchmark_size": 101,
+        "registry_benchmark_size": 101,
+        "added_agents": [
+          "ddb"
+        ],
+        "notes": "Training reward combines independently enabled VLM and trajectory scores. The shared browser judge saves evidence and uses a 1024x1000 desktop viewport by default. The original WebGen rubric score is recorded for comparison only."
+      }
+    ]
+  }
+]

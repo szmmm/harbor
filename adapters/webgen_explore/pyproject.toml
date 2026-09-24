@@ -1,0 +1,25 @@
+[project]
+name = "harbor-webgen-explore-adapter"
+version = "0.1.0"
+description = "Harbor adapter for exploratory evaluation of WebGen-Bench apps."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.4.1",
+    "harbor",
+    "harbor-ddb-explore-adapter",
+]
+
+[project.scripts]
+webgen-explore = "webgen_explore.main:main"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "webgen_explore"
+
+[tool.uv.sources]
+harbor-ddb-explore-adapter = { path = "../ddb_explore", editable = true }
+harbor = { path = "../..", editable = true }
