@@ -41,6 +41,21 @@ def valid_score(value) -> float:
     return float(value)
 
 
+def rubric_diagnostics(probe: dict) -> dict[str, float]:
+    """Numeric rubric results for monitoring. The bridge logs them; only "reward" trains."""
+    out = {}
+    for key in ("coverage", "pass_rate"):
+        value = probe.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[f"vlm_{key}"] = float(value)
+    if probe.get("status") in {"completed", "incomplete"}:
+        out["vlm_critical_failed"] = float(bool(probe.get("failed_critical")))
+    for branch, value in (probe.get("branches") or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[f"vlm_branch_{branch}"] = float(value)
+    return out
+
+
 def build_rewards(probe: dict, trajectory: dict, baseline: dict) -> dict[str, float]:
     selected = []
     rewards = {}
@@ -63,6 +78,7 @@ def build_rewards(probe: dict, trajectory: dict, baseline: dict) -> dict[str, fl
     if not selected:
         raise ValueError("Enable VLM_REWARD_ENABLED or TRAJECTORY_REWARD_ENABLED")
     rewards["reward"] = sum(selected) / len(selected)
+    rewards.update(rubric_diagnostics(probe))
     if baseline.get("status") == "completed":
         try:
             rewards["webgen_reward"] = valid_score(baseline.get("score"))

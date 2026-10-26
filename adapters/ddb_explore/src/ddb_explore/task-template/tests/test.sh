@@ -15,8 +15,9 @@ fi
 TRAJECTORY_REWARD_PATH=/logs/verifier/trajectory-reward.txt \
     timeout 60 python3 -u /tests/test_trajectory.py || true
 
-# Bound sidecars independently, leaving time to publish the final result.
-timeout 900 python3 -u /tests/test_explore.py || true
+# Bound sidecars independently, leaving time to publish the final result. The
+# judge stops itself at VLM_EXPLORE_DEADLINE_S (1500 s by default) to report.
+timeout 1800 python3 -u /tests/test_explore.py || true
 
 if [ -f /tests/ui_instruct.json ] && [ "${WEBGEN_BASELINE_ENABLED:-1}" = "1" ]; then
     timeout 1800 python3 -u /tests/test_baseline.py || true

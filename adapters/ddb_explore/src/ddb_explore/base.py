@@ -140,6 +140,9 @@ class ExploreAdapter[Record: ExploreRecord]:
     def _app_spec(self, record: Record) -> dict[str, Any]:
         return {"id": record.id, "instruction": record.instruction}
 
+    def _device(self, record: Record) -> str:
+        return self.default_device
+
     def _write_tests(self, paths: TaskPaths, record: Record) -> None:
         shutil.copytree(
             self.templates_dir / "tests",
@@ -148,7 +151,7 @@ class ExploreAdapter[Record: ExploreRecord]:
             ignore=shutil.ignore_patterns("__pycache__"),
         )
         (paths.tests_dir / "test.sh").chmod(0o755)
-        app_spec = {**self._app_spec(record), "default_device": self.default_device}
+        app_spec = {**self._app_spec(record), "default_device": self._device(record)}
         encoded = json.dumps(app_spec, ensure_ascii=False, indent=2) + "\n"
         for directory in (paths.tests_dir, paths.environment_dir):
             (directory / "app_spec.json").write_text(encoded, encoding="utf-8")
@@ -160,7 +163,7 @@ class ExploreAdapter[Record: ExploreRecord]:
         raw = (self.templates_dir / "task.toml").read_text()
         raw = raw.replace("{{TASK_ID}}", to_safe_id(record.id))
         raw = raw.replace("{{TASK_PREFIX}}", self.task_prefix)
-        raw = raw.replace("{{DEFAULT_DEVICE}}", self.default_device)
+        raw = raw.replace("{{DEFAULT_DEVICE}}", self._device(record))
         config = TaskConfig.model_validate_toml(raw)
         config.metadata = {**config.metadata, **self._task_metadata(record)}
         config.source = self.source

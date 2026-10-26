@@ -620,6 +620,29 @@ class PlaywrightEnv:
     async def get_viewport_size(self) -> dict[str, int]:
         return dict(self._viewport)
 
+    async def set_viewport(self, width: int, height: int) -> None:
+        """Resize the page. Coordinates and screenshots use the new size."""
+        await self.page.set_viewport_size({"width": width, "height": height})
+        self._viewport = {"width": width, "height": height}
+
+    async def clear_site_data(self) -> None:
+        """Delete cookies and the page origin's storage, as a new browser would have none."""
+        await self.page.context.clear_cookies()
+        await self.page.evaluate(
+            """async () => {
+                localStorage.clear();
+                sessionStorage.clear();
+                if (indexedDB.databases) {
+                    for (const db of await indexedDB.databases()) {
+                        if (db.name) indexedDB.deleteDatabase(db.name);
+                    }
+                }
+                if (window.caches) {
+                    for (const key of await caches.keys()) await caches.delete(key);
+                }
+            }"""
+        )
+
     # ── Mouse primitives (support button & modifiers) ──────────────
 
     _PLAYWRIGHT_MODIFIER_MAP = {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a running app with the shared evidence-based browser judge."""
+"""Evaluate a running app against the task's rubric tree with the browser judge."""
 
 from __future__ import annotations
 
@@ -18,11 +18,12 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from browser_env import PlaywrightEnv, resolve_device
-from judge import AppJudge
+from judge import RubricJudge
 from probe import ProbeConfig
 
 
 APP_SPEC_PATH = Path("/tests/app_spec.json")
+RUBRIC_PATH = Path("/tests/rubric.json")
 APP_DIR = Path("/app/workspace")
 REPORT_PATH = Path("/logs/verifier/explore-report.json")
 TRACE_PATH = Path("/logs/verifier/explore.trace.jsonl")
@@ -128,19 +129,23 @@ def wait_for_app_ready(url: str, timeout: float) -> bool:
     return False
 
 
-async def run_probe(app_url: str, app_spec: dict[str, Any]) -> dict[str, Any]:
-    """Run neutral evaluation without access to the benchmark's rubric rows."""
+async def run_probe(
+    app_url: str, app_spec: dict[str, Any], rubric: dict[str, Any]
+) -> dict[str, Any]:
+    """Judge every leaf of the task's rubric tree on the running app."""
     model = os.environ.get("VLM_MODEL", "Qwen/Qwen2.5-VL-32B-Instruct").strip()
     config = ProbeConfig(
         model=model,
         api_key=os.environ.get("VLM_API_KEY", "").strip(),
         base_url=os.environ.get("VLM_API_BASE_URL", "").strip(),
-        max_steps=int(os.environ.get("VLM_EXPLORE_MAX_STEPS", "24")),
-        request_timeout_s=60,
+        max_steps=int(os.environ.get("VLM_EXPLORE_MAX_STEPS", "40")),
+        request_timeout_s=float(os.environ.get("VLM_REQUEST_TIMEOUT_S", "120")),
         max_retries=1,
         temperature=0,
         omit_temperature=_truthy("VLM_OMIT_TEMPERATURE", "1"),
     )
+    deadline_s = float(os.environ.get("VLM_EXPLORE_DEADLINE_S", "1500"))
+    min_coverage = float(os.environ.get("VLM_RUBRIC_MIN_COVERAGE", "0.9"))
     device_name = (
         os.environ.get("VLM_EXPLORE_DEVICE", "").strip() or app_spec["default_device"]
     )
@@ -158,15 +163,14 @@ async def run_probe(app_url: str, app_spec: dict[str, Any]) -> dict[str, Any]:
     try:
         await env.start()
         try:
-            result = await AppJudge(
+            result = await RubricJudge(
                 env,
                 config,
                 REPORT_PATH.parent / "evidence",
+                deadline_s=deadline_s,
+                source_root=APP_DIR,
                 trace_sink=sink,
-            ).evaluate(
-                app_url,
-                str(app_spec.get("instruction") or ""),
-            )
+            ).evaluate(app_url, rubric, device=device, min_coverage=min_coverage)
         finally:
             await env.stop()
     finally:
@@ -174,7 +178,6 @@ async def run_probe(app_url: str, app_spec: dict[str, Any]) -> dict[str, Any]:
 
     return {
         **result,
-        "scoring": "fixed_rubric",
         "model": model,
         "app_url": app_url,
         "device": asdict(device)
@@ -182,6 +185,7 @@ async def run_probe(app_url: str, app_spec: dict[str, Any]) -> dict[str, Any]:
         else {"name": "desktop", "width": 1024, "height": 1000},
         "config": {
             "max_steps": config.max_steps,
+            "deadline_s": deadline_s,
             "temperature": None if config.omit_temperature else config.temperature,
         },
         "trace_path": str(TRACE_PATH),
@@ -214,18 +218,20 @@ def main() -> int:
         )
         print("=== Exploratory probe skipped: VLM_API_KEY is not set ===")
         return 0
-    if not APP_SPEC_PATH.is_file():
-        _write_report(
-            {
-                "status": "evaluator_failed",
-                "scoring": "disabled",
-                "error": f"{APP_SPEC_PATH} not found",
-                "findings": [],
-            }
-        )
-        return 1
+    for path in (APP_SPEC_PATH, RUBRIC_PATH):
+        if not path.is_file():
+            _write_report(
+                {
+                    "status": "evaluator_failed",
+                    "scoring": "disabled",
+                    "error": f"{path} not found",
+                    "findings": [],
+                }
+            )
+            return 1
 
     app_spec = json.loads(APP_SPEC_PATH.read_text(encoding="utf-8"))
+    rubric = json.loads(RUBRIC_PATH.read_text(encoding="utf-8"))
     override_url = os.environ.get("APP_BASE_URL", "").strip()
     process = None
     if override_url:
@@ -255,7 +261,7 @@ def main() -> int:
 
     try:
         try:
-            report = asyncio.run(run_probe(app_url, app_spec))
+            report = asyncio.run(run_probe(app_url, app_spec, rubric))
         except Exception as exc:
             report = {
                 "status": "evaluator_failed",

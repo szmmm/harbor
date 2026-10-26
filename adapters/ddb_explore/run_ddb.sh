@@ -20,7 +20,7 @@ source "$env_file"
 set +a
 
 : "${VLM_EXPLORE_ENABLED:=1}"
-: "${VLM_EXPLORE_MAX_STEPS:=24}"
+: "${VLM_EXPLORE_MAX_STEPS:=40}"
 : "${VLM_OMIT_TEMPERATURE:=1}"
 
 proxy_url="${DDB_PROXY_URL:-${PROXY_URL:-}}"
