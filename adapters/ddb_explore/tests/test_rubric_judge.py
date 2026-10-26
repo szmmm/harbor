@@ -366,8 +366,10 @@ def test_adapter_writes_rubric_tasks(tmp_path):
     mobile = {**RUBRIC, "id": "Mob_1", "spec": {**RUBRIC["spec"], "delivery": "mobile_app"}}
     source = tmp_path / "rubrics.jsonl"
     source.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (RUBRIC, mobile)), encoding="utf-8")
-    adapter = RubricAdapter(tmp_path / "out", dataset=RubricDataset(source))
+    adapter = RubricAdapter(tmp_path / "out", dataset=RubricDataset(source), registry_mirror="dockerproxy.net/")
     dirs = adapter.run()
+    dockerfile = (dirs[0] / "environment/Dockerfile").read_text()
+    assert "FROM dockerproxy.net/library/python:3.11-slim\n" in dockerfile
     assert [d.name for d in dirs] == ["ddb-explore-abc123", "ddb-explore-mob_1"]
     task = dirs[0]
     assert (task / "instruction.md").read_text(encoding="utf-8") == RUBRIC["prompt"]

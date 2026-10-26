@@ -16,6 +16,10 @@ def main() -> None:
         type=Path,
         help="Also write the slime prompt data JSONL here (one row per task).",
     )
+    parser.add_argument(
+        "--registry-mirror",
+        help="Pull the base image through this Docker Hub mirror, e.g. dockerproxy.net.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -25,6 +29,7 @@ def main() -> None:
         dataset=dataset,
         limit=args.limit,
         overwrite=args.overwrite,
+        registry_mirror=args.registry_mirror,
     )
     generated = adapter.run()
     print(f"Generated {len(generated)} tasks in {args.output_dir}")

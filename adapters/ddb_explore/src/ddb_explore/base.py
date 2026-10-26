@@ -31,6 +31,11 @@ class ExploreDataset[Record: ExploreRecord](Protocol):
     def get(self, task_id: str) -> Record: ...
 
 
+def docker_hub_name(image: str) -> str:
+    """Full Docker Hub repository path: python:3.11-slim -> library/python:3.11-slim."""
+    return image if "/" in image else f"library/{image}"
+
+
 def to_safe_id(raw_id: str) -> str:
     safe = re.sub(r"[^a-z0-9_-]", "-", raw_id.lower())
     return safe if re.match(r"^[a-z0-9]", safe) else f"t-{safe}"
@@ -51,6 +56,7 @@ class ExploreAdapter[Record: ExploreRecord]:
         task_ids: Iterable[str] | None = None,
         overwrite: bool = False,
         limit: int | None = None,
+        registry_mirror: str | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.templates_dir = Path(template_dir or TEMPLATE_DIR)
@@ -58,6 +64,7 @@ class ExploreAdapter[Record: ExploreRecord]:
         self._task_ids = list(task_ids) if task_ids is not None else None
         self._overwrite = overwrite
         self._limit = limit
+        self.registry_mirror = (registry_mirror or "").strip("/")
 
     def available_task_ids(self) -> list[str]:
         return self.dataset.ids()
@@ -132,6 +139,19 @@ class ExploreAdapter[Record: ExploreRecord]:
             paths.environment_dir,
             dirs_exist_ok=True,
         )
+        if self.registry_mirror:
+            # Hosts without Docker Hub access pull the base image through a
+            # mirror, as the r2egym runtime datasets do (dockerproxy.net).
+            dockerfile = paths.environment_dir / "Dockerfile"
+            text = dockerfile.read_text()
+            dockerfile.write_text(
+                re.sub(
+                    r"^FROM (\S+)",
+                    lambda m: f"FROM {self.registry_mirror}/{docker_hub_name(m.group(1))}",
+                    text,
+                    flags=re.MULTILINE,
+                )
+            )
 
     def _write_solution(self, paths: TaskPaths, record: Record) -> None:
         shutil.copy2(self.templates_dir / "solution/solve.sh", paths.solve_path)

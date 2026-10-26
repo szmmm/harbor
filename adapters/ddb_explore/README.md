@@ -26,6 +26,11 @@ is the task's directory name. Use `--limit 5` for a smaller dataset and
 `--overwrite` to write the tasks again. The script uses `uv` when it is
 installed, and `.venv/bin/python` when it is not.
 
+On h20 and h20-2, Docker Hub is not reachable. Add `--registry-mirror
+dockerproxy.net` so that the task Dockerfile pulls its base image through the
+mirror, as the r2egym runtime datasets do. The image itself installs Node.js,
+Playwright and Chromium with its system libraries.
+
 The input is the `rubrics.jsonl` of a generator run. Each row has `id`,
 `prompt`, `as_of`, `spec` and `tree`. Duplicate IDs, IDs that collide after
 normalization, blank prompts and trees without the four branches are rejected.
