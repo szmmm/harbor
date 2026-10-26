@@ -625,6 +625,10 @@ class PlaywrightEnv:
         await self.page.set_viewport_size({"width": width, "height": height})
         self._viewport = {"width": width, "height": height}
 
+    async def set_media(self, media: str) -> None:
+        """Render with print or screen CSS. Print media shows what a printout would show."""
+        await self.page.emulate_media(media=media)
+
     async def clear_site_data(self) -> None:
         """Delete cookies and the page origin's storage, as a new browser would have none."""
         await self.page.context.clear_cookies()

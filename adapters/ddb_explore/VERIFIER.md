@@ -21,6 +21,19 @@ page text, text location, screenshot). It gets the query, the user's today
 (`spec.time_frame.date`), the evaluation date, and the leaves. It tests
 critical leaves first.
 
+The judge has more tools for leaves that the screen alone cannot decide:
+
+- `set_viewport`: window size and full-screen checks.
+- `set_media`: print CSS, for print checks.
+- `clear_site_data`: delete cookies and browser storage, then reload. It acts
+  as a new browser or device, for checks that data is stored on a server.
+- `list_source_files`, `read_source_file`, `search_source`: read-only access
+  to the builder's workspace in `/app/workspace`, which the DDB agent uploads
+  without `.git`, `node_modules` and `dist`. They are for checks about the
+  framework, external scripts, single-file delivery, and where data is stored.
+  In the 100 rubrics of `dsv4-rand100-max-t1`, 44 critical leaves need the
+  source or a new session.
+
 The judge records verdicts with `record_verdicts` while it works: PASS, FAIL or
 UNTESTED, a reason, and the evidence IDs that support it. A later verdict for a
 leaf replaces the earlier one. Code rejects a verdict that cites an unknown or

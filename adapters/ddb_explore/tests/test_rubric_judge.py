@@ -175,6 +175,9 @@ class FakeEnv:
     async def clear_site_data(self):
         self.cleared = True
 
+    async def set_media(self, media):
+        self.media = media
+
     def reset_runtime_log(self):
         pass
 
@@ -262,7 +265,7 @@ def run_judge(tmp_path, script, *, max_steps=6, min_coverage=0.9):
 def test_page_and_source_tools_record_evidence(tmp_path):
     script = [
         [("set_viewport", {"width": 1920, "height": 1080}), ("clear_site_data", {}),
-         ("search_source", {"pattern": "localStorage"})],
+         ("search_source", {"pattern": "localStorage"}), ("set_media", {"media": "print"})],
         [("record_verdicts", {"verdicts": [
             verdict("I.1", "PASS", "e0001"),
             verdict("D.C.1", "FAIL", "e0002", "e0003"),
@@ -271,7 +274,7 @@ def test_page_and_source_tools_record_evidence(tmp_path):
     ]
     result, client = run_judge(tmp_path, script)
     actions = [row["action"] for row in result["evidence"]]
-    assert actions == ["open", "set_viewport", "clear_site_data", "search_source"]
+    assert actions == ["open", "set_viewport", "clear_site_data", "search_source", "set_media"]
     assert result["evidence"][3]["screenshot"] is None
     # D.B.1 is an interaction leaf: a PASS citing only the landing page is rejected.
     assert result["leaves"][3]["verdict"] == "UNTESTED"

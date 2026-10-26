@@ -37,6 +37,7 @@ ACTION_NAMES = {
     "reload",
     "scroll",
     "set_viewport",
+    "set_media",
     "clear_site_data",
 }
 # Observations kept in full in the model context; older ones keep their id only.
@@ -89,6 +90,7 @@ reload. Do not reward features that no leaf asks for.
 Other tools:
 - set_viewport changes the window size. For a full-screen check, use a full
   screen size such as 1920x1080.
+- set_media print shows the page as it prints. set_media screen goes back.
 - clear_site_data deletes the site's cookies and browser storage, then
   reloads. Use it as a new browser, a private window or another device: data
   that is still there after it comes from a server.
@@ -138,6 +140,13 @@ PAGE_TOOLS = [
             "height": {"type": "integer", "minimum": 320, "maximum": 1600},
         },
         required=["width", "height"],
+    ),
+    _fn(
+        "set_media",
+        "Render the page with print CSS (print) or normal CSS (screen). Take a "
+        "screenshot after print to see what a printout shows.",
+        {"media": {"type": "string", "enum": ["print", "screen"]}},
+        required=["media"],
     ),
     _fn(
         "clear_site_data",
@@ -310,6 +319,11 @@ class RubricJudge(ProbeAgent):
             await self._env.set_viewport(width, height)
             await self._env.wait_settled()
             return {"success": True, "text": f"viewport is {width}x{height}"}
+        if name == "set_media":
+            media = "print" if args.get("media") == "print" else "screen"
+            await self._env.set_media(media)
+            await self._env.wait_settled()
+            return {"success": True, "text": f"page renders with {media} CSS"}
         await self._env.clear_site_data()
         out = await self._executor.reload({})
         return {**out, "text": "site data deleted, page reloaded"}
@@ -454,7 +468,7 @@ class RubricJudge(ProbeAgent):
                 elif name in BROWSER_NAMES:
                     if name == "take_screenshot":
                         outcome = {"success": True}
-                    elif name in {"set_viewport", "clear_site_data"}:
+                    elif name in {"set_viewport", "set_media", "clear_site_data"}:
                         outcome = await self._page_tool(name, args)
                     else:
                         outcome = await self._dispatch(name, args)
