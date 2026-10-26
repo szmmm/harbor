@@ -370,6 +370,8 @@ def test_adapter_writes_rubric_tasks(tmp_path):
     dirs = adapter.run()
     dockerfile = (dirs[0] / "environment/Dockerfile").read_text()
     assert "FROM dockerproxy.net/library/python:3.11-slim\n" in dockerfile
+    # One environment for all tasks, so Harbor builds and caches one image.
+    assert sorted(p.name for p in (dirs[0] / "environment").iterdir()) == ["Dockerfile"]
     assert [d.name for d in dirs] == ["ddb-explore-abc123", "ddb-explore-mob_1"]
     task = dirs[0]
     assert (task / "instruction.md").read_text(encoding="utf-8") == RUBRIC["prompt"]

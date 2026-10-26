@@ -173,8 +173,9 @@ class ExploreAdapter[Record: ExploreRecord]:
         (paths.tests_dir / "test.sh").chmod(0o755)
         app_spec = {**self._app_spec(record), "default_device": self._device(record)}
         encoded = json.dumps(app_spec, ensure_ascii=False, indent=2) + "\n"
-        for directory in (paths.tests_dir, paths.environment_dir):
-            (directory / "app_spec.json").write_text(encoded, encoding="utf-8")
+        # Only the verifier reads it. A copy in environment/ would change the
+        # environment hash, so every task would build its own image.
+        (paths.tests_dir / "app_spec.json").write_text(encoded, encoding="utf-8")
 
     def _task_metadata(self, record: Record) -> dict[str, Any]:
         return {}

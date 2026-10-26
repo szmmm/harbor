@@ -18,6 +18,3 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 RUN git init /app
-
-# Task context for the exploratory probe. This has no fixed expected result.
-COPY app_spec.json /app/app_spec.json
