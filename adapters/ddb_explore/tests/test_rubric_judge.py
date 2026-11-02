@@ -5,9 +5,8 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 import combine_rewards
+import pytest
 from judge import FINAL_TURNS, RubricJudge, check_verdict
 from probe import ProbeConfig
 from rubric_score import flatten, score_tree
@@ -48,8 +47,16 @@ TREE = {
         "id": "D",
         "description": "dynamic",
         "children": [
-            {"id": "D.B", "description": "basic", "children": [leaf("D.B.1", "可删除", verify_by="interaction")]},
-            {"id": "D.C", "description": "complex", "children": [leaf("D.C.1", "刷新后仍在", verify_by="interaction")]},
+            {
+                "id": "D.B",
+                "description": "basic",
+                "children": [leaf("D.B.1", "可删除", verify_by="interaction")],
+            },
+            {
+                "id": "D.C",
+                "description": "complex",
+                "children": [leaf("D.C.1", "刷新后仍在", verify_by="interaction")],
+            },
         ],
     },
 }
@@ -58,7 +65,11 @@ RUBRIC = {
     "prompt": "做一个食材过期提醒应用",
     "as_of": "2026-10-24",
     "method": "full",
-    "spec": {"delivery": "single_page", "ui_language": "zh", "time_frame": {"date": "2026-10-24"}},
+    "spec": {
+        "delivery": "single_page",
+        "ui_language": "zh",
+        "time_frame": {"date": "2026-10-24"},
+    },
     "tree": TREE,
     "meta": {"stats": {"leaves": 5}},
 }
@@ -68,12 +79,20 @@ IDS = [l["id"] for l in LEAVES]
 
 def test_flatten_reads_all_branches_in_order():
     assert IDS == ["I.1", "S.1.1", "S.1.2", "D.B.1", "D.C.1"]
-    assert [l["branch"] for l in LEAVES] == ["intention", "static", "static", "dynamic", "dynamic"]
+    assert [l["branch"] for l in LEAVES] == [
+        "intention",
+        "static",
+        "static",
+        "dynamic",
+        "dynamic",
+    ]
     assert LEAVES[0]["critical"] and not LEAVES[1]["critical"]
 
 
 def test_score_is_flat_pass_rate():
-    result = score_tree(LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"}, min_coverage=1)
+    result = score_tree(
+        LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"}, min_coverage=1
+    )
     assert result["status"] == "completed"
     assert result["score"] == pytest.approx(4 / 5)
     assert result["branches"]["static"] == pytest.approx(0.5)
@@ -82,7 +101,11 @@ def test_score_is_flat_pass_rate():
 
 def test_failed_critical_leaf_gates_to_zero_even_with_gaps():
     result = score_tree(LEAVES, {"I.1": "FAIL"}, min_coverage=0.9)
-    assert (result["status"], result["score"], result["failed_critical"]) == ("completed", 0.0, ["I.1"])
+    assert (result["status"], result["score"], result["failed_critical"]) == (
+        "completed",
+        0.0,
+        ["I.1"],
+    )
 
 
 def test_untested_critical_leaf_has_no_score():
@@ -104,7 +127,9 @@ def test_low_coverage_has_no_score_and_enough_coverage_scores_resolved_leaves():
     reason="set RUBRICS_JSONL to check real trees",
 )
 def test_flatten_matches_generator_leaf_counts():
-    for line in Path(os.environ["RUBRICS_JSONL"]).read_text(encoding="utf-8").splitlines():
+    for line in (
+        Path(os.environ["RUBRICS_JSONL"]).read_text(encoding="utf-8").splitlines()
+    ):
         row = json.loads(line)
         assert len(flatten(row["tree"])) == row["meta"]["stats"]["leaves"]
 
@@ -120,13 +145,59 @@ BY_ID = {l["id"]: l for l in LEAVES}
 @pytest.mark.parametrize(
     "item, message",
     [
-        ({"leaf_id": "X", "verdict": "PASS", "reason": "r", "evidence_ids": ["e0000"]}, "unknown leaf"),
-        ({"leaf_id": "S.1.1", "verdict": "MAYBE", "reason": "r", "evidence_ids": []}, "verdict must be"),
-        ({"leaf_id": "S.1.1", "verdict": "PASS", "reason": " ", "evidence_ids": ["e0000"]}, "reason is empty"),
-        ({"leaf_id": "S.1.1", "verdict": "PASS", "reason": "r", "evidence_ids": ["e9"]}, "unknown evidence"),
-        ({"leaf_id": "S.1.1", "verdict": "FAIL", "reason": "r", "evidence_ids": []}, "at least one"),
-        ({"leaf_id": "S.1.1", "verdict": "PASS", "reason": "r", "evidence_ids": ["e0002"]}, "tool succeeded"),
-        ({"leaf_id": "I.1", "verdict": "PASS", "reason": "r", "evidence_ids": ["e0000"]}, "after an action"),
+        (
+            {
+                "leaf_id": "X",
+                "verdict": "PASS",
+                "reason": "r",
+                "evidence_ids": ["e0000"],
+            },
+            "unknown leaf",
+        ),
+        (
+            {"leaf_id": "S.1.1", "verdict": "MAYBE", "reason": "r", "evidence_ids": []},
+            "verdict must be",
+        ),
+        (
+            {
+                "leaf_id": "S.1.1",
+                "verdict": "PASS",
+                "reason": " ",
+                "evidence_ids": ["e0000"],
+            },
+            "reason is empty",
+        ),
+        (
+            {
+                "leaf_id": "S.1.1",
+                "verdict": "PASS",
+                "reason": "r",
+                "evidence_ids": ["e9"],
+            },
+            "unknown evidence",
+        ),
+        (
+            {"leaf_id": "S.1.1", "verdict": "FAIL", "reason": "r", "evidence_ids": []},
+            "at least one",
+        ),
+        (
+            {
+                "leaf_id": "S.1.1",
+                "verdict": "PASS",
+                "reason": "r",
+                "evidence_ids": ["e0002"],
+            },
+            "tool succeeded",
+        ),
+        (
+            {
+                "leaf_id": "I.1",
+                "verdict": "PASS",
+                "reason": "r",
+                "evidence_ids": ["e0000"],
+            },
+            "after an action",
+        ),
     ],
 )
 def test_check_verdict_rejects(item, message):
@@ -136,14 +207,37 @@ def test_check_verdict_rejects(item, message):
 
 def test_check_verdict_accepts():
     ok = check_verdict(
-        {"leaf_id": "I.1", "verdict": "PASS", "reason": "added", "evidence_ids": ["e0001"]},
+        {
+            "leaf_id": "I.1",
+            "verdict": "PASS",
+            "reason": "added",
+            "evidence_ids": ["e0001"],
+        },
         BY_ID,
         EVIDENCE,
     )
     assert ok["verdict"] == "PASS"
     # A missing feature can fail from the landing page; UNTESTED needs no evidence.
-    check_verdict({"leaf_id": "I.1", "verdict": "FAIL", "reason": "no form", "evidence_ids": ["e0000"]}, BY_ID, EVIDENCE)
-    check_verdict({"leaf_id": "D.C.1", "verdict": "UNTESTED", "reason": "budget", "evidence_ids": []}, BY_ID, EVIDENCE)
+    check_verdict(
+        {
+            "leaf_id": "I.1",
+            "verdict": "FAIL",
+            "reason": "no form",
+            "evidence_ids": ["e0000"],
+        },
+        BY_ID,
+        EVIDENCE,
+    )
+    check_verdict(
+        {
+            "leaf_id": "D.C.1",
+            "verdict": "UNTESTED",
+            "reason": "budget",
+            "evidence_ids": [],
+        },
+        BY_ID,
+        EVIDENCE,
+    )
 
 
 def test_source_tree_reads_inside_root_only(tmp_path):
@@ -157,7 +251,10 @@ def test_source_tree_reads_inside_root_only(tmp_path):
     tree = SourceTree(tmp_path)
     listing = tree.list_files()["text"]
     assert "src/app.js" in listing and "node_modules" not in listing
-    assert tree.search("from 'react'")["text"] == "src/app.js:1: import React from 'react';"
+    assert (
+        tree.search("from 'react'")["text"]
+        == "src/app.js:1: import React from 'react';"
+    )
     assert "const x" in tree.read("src/app.js")["text"]
     assert not tree.read("../outside.txt")["success"]
     assert not tree.read("logo.png")["success"]
@@ -196,7 +293,11 @@ class FakeEnv:
 
 class FakeInspector:
     async def interactive_snapshot(self, args):
-        return {"success": True, "text": "[0] button '添加'", "data": {"nodes": [{"name": "添加", "role": "button", "x": 5, "y": 5}]}}
+        return {
+            "success": True,
+            "text": "[0] button '添加'",
+            "data": {"nodes": [{"name": "添加", "role": "button", "x": 5, "y": 5}]},
+        }
 
     async def get_page_info(self, args):
         return {"success": True, "text": "牛奶 2026-10-30"}
@@ -223,7 +324,9 @@ class FakeClient:
         tool_calls = [
             SimpleNamespace(
                 id=f"c{len(self.requests)}-{n}",
-                function=SimpleNamespace(name=name, arguments=json.dumps(args, ensure_ascii=False)),
+                function=SimpleNamespace(
+                    name=name, arguments=json.dumps(args, ensure_ascii=False)
+                ),
                 model_dump=lambda name=name, args=args, n=n: {
                     "id": f"c{len(self.requests)}-{n}",
                     "type": "function",
@@ -241,13 +344,20 @@ class FakeClient:
 
 
 def verdict(leaf_id, value, *evidence):
-    return {"leaf_id": leaf_id, "verdict": value, "reason": "seen", "evidence_ids": list(evidence)}
+    return {
+        "leaf_id": leaf_id,
+        "verdict": value,
+        "reason": "seen",
+        "evidence_ids": list(evidence),
+    }
 
 
 def run_judge(tmp_path, script, *, max_steps=6, min_coverage=0.9):
     client = FakeClient(script)
     (tmp_path / "workspace").mkdir(exist_ok=True)
-    (tmp_path / "workspace/index.html").write_text("<script>localStorage.setItem('x', 1)</script>")
+    (tmp_path / "workspace/index.html").write_text(
+        "<script>localStorage.setItem('x', 1)</script>"
+    )
     judge = RubricJudge(
         FakeEnv(),
         ProbeConfig(model="m", api_key="k", max_steps=max_steps, omit_temperature=True),
@@ -258,27 +368,49 @@ def run_judge(tmp_path, script, *, max_steps=6, min_coverage=0.9):
         inspector=FakeInspector(),
     )
     judge._make_client = lambda: client
-    result = asyncio.run(judge.evaluate("http://app", RUBRIC, min_coverage=min_coverage))
+    result = asyncio.run(
+        judge.evaluate("http://app", RUBRIC, min_coverage=min_coverage)
+    )
     return result, client
 
 
 def test_page_and_source_tools_record_evidence(tmp_path):
     script = [
-        [("set_viewport", {"width": 1920, "height": 1080}), ("clear_site_data", {}),
-         ("search_source", {"pattern": "localStorage"}), ("set_media", {"media": "print"})],
-        [("record_verdicts", {"verdicts": [
-            verdict("I.1", "PASS", "e0001"),
-            verdict("D.C.1", "FAIL", "e0002", "e0003"),
-        ] + [verdict(i, "PASS", "e0000") for i in ("S.1.1", "S.1.2", "D.B.1")]})],
+        [
+            ("set_viewport", {"width": 1920, "height": 1080}),
+            ("clear_site_data", {}),
+            ("search_source", {"pattern": "localStorage"}),
+            ("set_media", {"media": "print"}),
+        ],
+        [
+            (
+                "record_verdicts",
+                {
+                    "verdicts": [
+                        verdict("I.1", "PASS", "e0001"),
+                        verdict("D.C.1", "FAIL", "e0002", "e0003"),
+                    ]
+                    + [verdict(i, "PASS", "e0000") for i in ("S.1.1", "S.1.2", "D.B.1")]
+                },
+            )
+        ],
         [("finish", {"summary": "done"})],
     ]
     result, client = run_judge(tmp_path, script)
     actions = [row["action"] for row in result["evidence"]]
-    assert actions == ["open", "set_viewport", "clear_site_data", "search_source", "set_media"]
+    assert actions == [
+        "open",
+        "set_viewport",
+        "clear_site_data",
+        "search_source",
+        "set_media",
+    ]
     assert result["evidence"][3]["screenshot"] is None
     # D.B.1 is an interaction leaf: a PASS citing only the landing page is rejected.
     assert result["leaves"][3]["verdict"] == "UNTESTED"
-    assert result["status"] == "incomplete" and result["coverage"] == pytest.approx(4 / 5)
+    assert result["status"] == "incomplete" and result["coverage"] == pytest.approx(
+        4 / 5
+    )
     source = json.loads((tmp_path / "evidence/e0003.json").read_text())
     assert "index.html:1:" in source["outcome"]["text"]
 
@@ -286,21 +418,37 @@ def test_page_and_source_tools_record_evidence(tmp_path):
 def test_judge_loop_scores_recorded_verdicts(tmp_path):
     script = [
         [("click_ref", {"ref": 0}), ("get_page_info", {})],
-        [("record_verdicts", {"verdicts": [
-            verdict("I.1", "PASS", "e0001"),
-            verdict("S.1.1", "PASS", "e0002"),
-            verdict("S.1.2", "FAIL", "e0002"),
-            verdict("D.B.1", "PASS", "e0001"),
-        ]})],
+        [
+            (
+                "record_verdicts",
+                {
+                    "verdicts": [
+                        verdict("I.1", "PASS", "e0001"),
+                        verdict("S.1.1", "PASS", "e0002"),
+                        verdict("S.1.2", "FAIL", "e0002"),
+                        verdict("D.B.1", "PASS", "e0001"),
+                    ]
+                },
+            )
+        ],
         [("finish", {"summary": "too early"})],
-        [("reload", {}), ("record_verdicts", {"verdicts": [verdict("D.C.1", "PASS", "e0003")]})],
+        [
+            ("reload", {}),
+            ("record_verdicts", {"verdicts": [verdict("D.C.1", "PASS", "e0003")]}),
+        ],
         [("finish", {"summary": "食材应用"})],
     ]
     result, client = run_judge(tmp_path, script)
     assert result["status"] == "completed", result
     assert result["score"] == pytest.approx(4 / 5)
     assert result["finished_by_model"] and result["summary"] == "食材应用"
-    assert [row["verdict"] for row in result["leaves"]] == ["PASS", "PASS", "FAIL", "PASS", "PASS"]
+    assert [row["verdict"] for row in result["leaves"]] == [
+        "PASS",
+        "PASS",
+        "FAIL",
+        "PASS",
+        "PASS",
+    ]
     assert len(result["evidence"]) == 4 and (tmp_path / "evidence/e0003.png").is_file()
     # The early finish was refused with the leaves that still need a verdict.
     refused = [m for m in client.requests[3]["messages"] if m["role"] == "tool"][-1]
@@ -313,8 +461,15 @@ def test_judge_forces_verdicts_when_budget_ends(tmp_path):
     script = [
         [("click_ref", {"ref": 0})],
         [("click_ref", {"ref": 0})],
-        [("record_verdicts", {"verdicts": [verdict(i, "PASS", "e0001") for i in IDS[:4]]
-                              + [verdict("D.C.1", "UNTESTED")]})],
+        [
+            (
+                "record_verdicts",
+                {
+                    "verdicts": [verdict(i, "PASS", "e0001") for i in IDS[:4]]
+                    + [verdict("D.C.1", "UNTESTED")]
+                },
+            )
+        ],
     ]
     result, client = run_judge(tmp_path, script, max_steps=2, min_coverage=0.8)
     final = client.requests[-1]
@@ -344,8 +499,11 @@ def test_old_observations_lose_snapshots(tmp_path):
     # The open page and 7 clicks: the 4 most recent keep their snapshots.
     assert [("snapshot" in t) for t in texts] == [False] * 4 + [True] * 4
     images = [
-        item for m in client.requests[-1]["messages"] if isinstance(m["content"], list)
-        for item in m["content"] if item["type"] == "image_url"
+        item
+        for m in client.requests[-1]["messages"]
+        if isinstance(m["content"], list)
+        for item in m["content"]
+        if item["type"] == "image_url"
     ]
     assert len(images) == 3
 
@@ -353,20 +511,43 @@ def test_old_observations_lose_snapshots(tmp_path):
 def test_reward_combiner_adds_rubric_diagnostics(monkeypatch):
     monkeypatch.setenv("VLM_REWARD_ENABLED", "1")
     monkeypatch.setenv("TRAJECTORY_REWARD_ENABLED", "0")
-    probe = {"status": "completed", "score": 0.8, "coverage": 1.0, "pass_rate": 0.8,
-             "failed_critical": [], "branches": {"intention": 1.0, "content": None}}
-    rewards = combine_rewards.build_rewards(probe, {"status": "missing"}, {})
-    assert rewards == {"vlm_reward": 0.8, "reward": 0.8, "vlm_coverage": 1.0, "vlm_pass_rate": 0.8,
-                       "vlm_critical_failed": 0.0, "vlm_branch_intention": 1.0}
+    probe = {
+        "status": "completed",
+        "score": 0.8,
+        "coverage": 1.0,
+        "pass_rate": 0.8,
+        "failed_critical": [],
+        "branches": {"intention": 1.0, "content": None},
+    }
+    rewards = combine_rewards.build_rewards(probe, {"status": "missing"})
+    assert rewards == {
+        "vlm_reward": 0.8,
+        "reward": 0.8,
+        "vlm_coverage": 1.0,
+        "vlm_pass_rate": 0.8,
+        "vlm_critical_failed": 0.0,
+        "vlm_branch_intention": 1.0,
+    }
 
 
 def test_adapter_writes_rubric_tasks(tmp_path):
     from ddb_explore.adapter import RubricAdapter, RubricDataset
 
-    mobile = {**RUBRIC, "id": "Mob_1", "spec": {**RUBRIC["spec"], "delivery": "mobile_app"}}
+    mobile = {
+        **RUBRIC,
+        "id": "Mob_1",
+        "spec": {**RUBRIC["spec"], "delivery": "mobile_app"},
+    }
     source = tmp_path / "rubrics.jsonl"
-    source.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (RUBRIC, mobile)), encoding="utf-8")
-    adapter = RubricAdapter(tmp_path / "out", dataset=RubricDataset(source), registry_mirror="dockerproxy.net/")
+    source.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (RUBRIC, mobile)),
+        encoding="utf-8",
+    )
+    adapter = RubricAdapter(
+        tmp_path / "out",
+        dataset=RubricDataset(source),
+        registry_mirror="dockerproxy.net/",
+    )
     dirs = adapter.run()
     dockerfile = (dirs[0] / "environment/Dockerfile").read_text()
     assert "FROM dockerproxy.net/library/python:3.11-slim\n" in dockerfile
@@ -375,12 +556,28 @@ def test_adapter_writes_rubric_tasks(tmp_path):
     assert [d.name for d in dirs] == ["ddb-explore-abc123", "ddb-explore-mob_1"]
     task = dirs[0]
     assert (task / "instruction.md").read_text(encoding="utf-8") == RUBRIC["prompt"]
-    assert json.loads((task / "tests/rubric.json").read_text(encoding="utf-8")) == RUBRIC
-    assert json.loads((task / "tests/app_spec.json").read_text())["default_device"] == "desktop"
-    assert json.loads((dirs[1] / "tests/app_spec.json").read_text())["default_device"] == "HUAWEI Mate 80 Pro Max"
+    assert (
+        json.loads((task / "tests/rubric.json").read_text(encoding="utf-8")) == RUBRIC
+    )
+    assert (
+        json.loads((task / "tests/app_spec.json").read_text())["default_device"]
+        == "desktop"
+    )
+    assert (
+        json.loads((dirs[1] / "tests/app_spec.json").read_text())["default_device"]
+        == "HUAWEI Mate 80 Pro Max"
+    )
     config = tomllib.loads((task / "task.toml").read_text())
-    assert config["verifier"]["env"]["VLM_EXPLORE_DEVICE"] == "${VLM_EXPLORE_DEVICE:-desktop}"
+    assert (
+        config["verifier"]["env"]["VLM_EXPLORE_DEVICE"]
+        == "${VLM_EXPLORE_DEVICE:-desktop}"
+    )
     assert config["metadata"]["prompt_id"] == "abc123"
-    assert (task / "tests/rubric_score.py").is_file() and (task / "tests/judge.py").is_file()
+    assert (task / "tests/rubric_score.py").is_file() and (
+        task / "tests/judge.py"
+    ).is_file()
     rows = adapter.prompt_rows(["abc123", "Mob_1"])
-    assert rows[1] == {"instruction": RUBRIC["prompt"], "metadata": {"task_id": "ddb-explore-mob_1"}}
+    assert rows[1] == {
+        "instruction": RUBRIC["prompt"],
+        "metadata": {"task_id": "ddb-explore-mob_1"},
+    }

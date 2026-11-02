@@ -5,8 +5,9 @@ Create Harbor tasks from the rubric trees of
 user's query as its instruction and the query's own rubric tree in
 `tests/rubric.json`. A browser judge tests the built app against every leaf of
 the tree. The builder never sees the rubric.
-`webgen_explore` imports the base adapter from `ddb_explore.base` and reuses
-the verifier files in `ddb_explore/task-template`.
+The verifier uses a rubric judge with shared browser helpers. Trajectory
+scoring is optional and lives in `test_trajectory.py`; setting
+`TRAJECTORY_REWARD_ENABLED=0` skips it entirely.
 
 ## Generate and run
 

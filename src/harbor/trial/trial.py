@@ -390,7 +390,14 @@ class Trial(ABC):
             self.logger.warning(f"Agent teardown failed: {exc}")
         await self._stop_agent_environment()
         self.result.finished_at = self._now()
-        self.paths.result_path.write_text(self.result.model_dump_json(indent=4))
+        self.paths.result_path.write_text(
+            self.result.model_dump_json(
+                indent=4,
+                exclude={
+                    "agent_result": {"metadata": {"token_ids", "masks", "logprobs"}}
+                },
+            )
+        )
         await self._emit(TrialEvent.END)
 
     def _record_exception(self, exc: BaseException) -> None:

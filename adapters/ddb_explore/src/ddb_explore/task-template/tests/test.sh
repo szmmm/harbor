@@ -1,5 +1,5 @@
 #!/bin/bash
-# Each enabled reward component is required. The original rubric is diagnostic.
+# Each enabled reward component is required.
 set -uo pipefail
 mkdir -p /logs/verifier
 rm -f /logs/verifier/reward.txt /logs/verifier/reward.json \
@@ -12,16 +12,14 @@ if [ -z "${APP_BASE_URL:-}" ] && [ -f /tmp/harbor_preview_url ]; then
     export APP_BASE_URL
 fi
 
-TRAJECTORY_REWARD_PATH=/logs/verifier/trajectory-reward.txt \
-    timeout 60 python3 -u /tests/test_trajectory.py || true
+if [ "${TRAJECTORY_REWARD_ENABLED:-1}" = "1" ]; then
+    TRAJECTORY_REWARD_PATH=/logs/verifier/trajectory-reward.txt \
+        timeout 60 python3 -u /tests/test_trajectory.py || true
+fi
 
 # Bound sidecars independently, leaving time to publish the final result. The
 # judge stops itself at VLM_EXPLORE_DEADLINE_S (1500 s by default) to report.
 timeout 1800 python3 -u /tests/test_explore.py || true
-
-if [ -f /tests/ui_instruct.json ] && [ "${WEBGEN_BASELINE_ENABLED:-1}" = "1" ]; then
-    timeout 1800 python3 -u /tests/test_baseline.py || true
-fi
 
 # Missing evidence must not become a zero-valued training example.
 python3 -u /tests/combine_rewards.py

@@ -56,7 +56,7 @@ def rubric_diagnostics(probe: dict) -> dict[str, float]:
     return out
 
 
-def build_rewards(probe: dict, trajectory: dict, baseline: dict) -> dict[str, float]:
+def build_rewards(probe: dict, trajectory: dict) -> dict[str, float]:
     selected = []
     rewards = {}
     for name, report, value in (
@@ -64,6 +64,8 @@ def build_rewards(probe: dict, trajectory: dict, baseline: dict) -> dict[str, fl
         ("trajectory", trajectory, trajectory.get("reward")),
     ):
         active = enabled(f"{name.upper()}_REWARD_ENABLED")
+        if not active:
+            continue
         try:
             if report.get("status") not in {None, "completed"}:
                 raise ValueError(f"{name} evaluation status: {report.get('status')}")
@@ -79,11 +81,6 @@ def build_rewards(probe: dict, trajectory: dict, baseline: dict) -> dict[str, fl
         raise ValueError("Enable VLM_REWARD_ENABLED or TRAJECTORY_REWARD_ENABLED")
     rewards["reward"] = sum(selected) / len(selected)
     rewards.update(rubric_diagnostics(probe))
-    if baseline.get("status") == "completed":
-        try:
-            rewards["webgen_reward"] = valid_score(baseline.get("score"))
-        except ValueError:
-            pass  # A diagnostic baseline must not invalidate a training reward.
     return rewards
 
 
@@ -91,21 +88,23 @@ def main() -> None:
     for name in ("reward.json", "reward.txt"):
         (REWARD_DIR / name).unlink(missing_ok=True)
     probe = read_report("explore-report.json")
-    trajectory = read_report("trajectory-score.json")
-    baseline = read_report("webgen-report.json")
+    trajectory = (
+        read_report("trajectory-score.json")
+        if enabled("TRAJECTORY_REWARD_ENABLED")
+        else {"status": "disabled"}
+    )
     result = {
         "schema_version": 2,
         "reward_mode": "enabled_component_mean",
         "probe": probe,
         "trajectory": trajectory,
-        "webgen_baseline": baseline,
         "reward_switches": {
             key: os.environ.get(key, "1")
             for key in ("VLM_REWARD_ENABLED", "TRAJECTORY_REWARD_ENABLED")
         },
     }
     try:
-        rewards = build_rewards(probe, trajectory, baseline)
+        rewards = build_rewards(probe, trajectory)
     except ValueError as exc:
         result.update(status="evaluator_failed", error=str(exc), rewards=None)
         (REWARD_DIR / "evaluation-result.json").write_text(

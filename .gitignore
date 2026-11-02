@@ -227,6 +227,7 @@ tmp/
 /.mcp.json
 /parity-experiments/
 ./dataset
+adapters/*.bak
 
 # Viewer static files (built in CI)
 src/harbor/viewer/static/
