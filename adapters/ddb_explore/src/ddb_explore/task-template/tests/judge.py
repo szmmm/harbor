@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from probe import ProbeAgent, _device_block, _fn, _PROBE_TOOLS, _temperature_rejected
+from probe import _PROBE_TOOLS, ProbeAgent, _device_block, _fn, _temperature_rejected
 from rubric_score import VERDICTS, flatten, score_tree
 from source_tools import SourceTree
 
@@ -173,9 +173,7 @@ SOURCE_TOOLS = [
         required=["pattern"],
     ),
 ]
-BROWSER_TOOLS = [
-    tool for tool in _PROBE_TOOLS if tool["function"]["name"] != "report_findings"
-] + PAGE_TOOLS
+BROWSER_TOOLS = _PROBE_TOOLS + PAGE_TOOLS
 BROWSER_NAMES = {tool["function"]["name"] for tool in BROWSER_TOOLS}
 SOURCE_NAMES = {tool["function"]["name"] for tool in SOURCE_TOOLS}
 
@@ -309,7 +307,12 @@ class RubricJudge(ProbeAgent):
         )
         self.evidence.append(record)
         self._emit({"kind": "evidence", "id": eid, "path": f"evidence/{eid}.json"})
-        text = {"evidence_id": eid, "action": action, "success": record["success"], "outcome": outcome}
+        text = {
+            "evidence_id": eid,
+            "action": action,
+            "success": record["success"],
+            "outcome": outcome,
+        }
         return [{"type": "text", "text": json.dumps(text, ensure_ascii=False)}]
 
     async def _page_tool(self, name: str, args: dict) -> dict:
@@ -332,7 +335,9 @@ class RubricJudge(ProbeAgent):
         if name == "list_source_files":
             return self.source.list_files()
         if name == "read_source_file":
-            return self.source.read(str(args.get("path") or ""), args.get("offset") or 0)
+            return self.source.read(
+                str(args.get("path") or ""), args.get("offset") or 0
+            )
         return self.source.search(str(args.get("pattern") or ""))
 
     async def _request(self, client, messages, tools, tool_choice):
@@ -345,6 +350,10 @@ class RubricJudge(ProbeAgent):
         }
         if not self._no_temperature:
             request["temperature"] = self._cfg.temperature
+        turn = self.model_turns + 1
+        self._emit(
+            {"kind": "judge_request", "turn": turn, "attempt": 1, "request": request}
+        )
         try:
             response = await asyncio.to_thread(
                 client.chat.completions.create, **request
@@ -354,9 +363,24 @@ class RubricJudge(ProbeAgent):
                 raise
             self._no_temperature = True
             request.pop("temperature")
+            self._emit(
+                {
+                    "kind": "judge_request",
+                    "turn": turn,
+                    "attempt": 2,
+                    "request": request,
+                }
+            )
             response = await asyncio.to_thread(
                 client.chat.completions.create, **request
             )
+        self._emit(
+            {
+                "kind": "judge_response",
+                "turn": turn,
+                "response": response.model_dump(mode="json"),
+            }
+        )
         self.model_turns += 1
         usage = getattr(response, "usage", None)
         for key in self.usage:
@@ -390,7 +414,8 @@ class RubricJudge(ProbeAgent):
 
     def _may_finish(self, leaves: list[dict]) -> bool:
         return not self._missing(leaves) or any(
-            leaf["critical"] and self.verdicts.get(leaf["id"], {}).get("verdict") == "FAIL"
+            leaf["critical"]
+            and self.verdicts.get(leaf["id"], {}).get("verdict") == "FAIL"
             for leaf in leaves
         )
 
@@ -439,7 +464,10 @@ class RubricJudge(ProbeAgent):
         messages.append(assistant)
         if not calls:
             messages.append(
-                {"role": "user", "content": "Use a browser tool, record_verdicts or finish."}
+                {
+                    "role": "user",
+                    "content": "Use a browser tool, record_verdicts or finish.",
+                }
             )
             return False
         observations, finished = [], False
@@ -500,7 +528,8 @@ class RubricJudge(ProbeAgent):
         spec = rubric.get("spec") or {}
         task = {
             "request": rubric["prompt"],
-            "user_today": (spec.get("time_frame") or {}).get("date") or rubric.get("as_of"),
+            "user_today": (spec.get("time_frame") or {}).get("date")
+            or rubric.get("as_of"),
             "evaluation_date": datetime.date.today().isoformat(),
             "ui_language": spec.get("ui_language"),
             "leaves": [
@@ -526,7 +555,10 @@ class RubricJudge(ProbeAgent):
         try:
             self._env.reset_runtime_log()
             await self._env.goto(app_url)
-            first = {"role": "user", "content": await self._observe("open", {}, {"success": True})}
+            first = {
+                "role": "user",
+                "content": await self._observe("open", {}, {"success": True}),
+            }
             messages.append(first)
             self._observations.append(first)
             finished, step = False, 0
@@ -584,7 +616,10 @@ class RubricJudge(ProbeAgent):
                     "critical": leaf["critical"],
                     "verify_by": leaf["verify_by"],
                     "description": leaf["description"],
-                    **self.verdicts.get(leaf["id"], {"verdict": "UNTESTED", "reason": "", "evidence_ids": []}),
+                    **self.verdicts.get(
+                        leaf["id"],
+                        {"verdict": "UNTESTED", "reason": "", "evidence_ids": []},
+                    ),
                 }
                 for leaf in leaves
             ],
@@ -596,5 +631,7 @@ class RubricJudge(ProbeAgent):
             usage=self.usage,
             elapsed_seconds=time.monotonic() - started,
         )
-        self._emit({"kind": "evaluation", **{k: v for k, v in result.items() if k != "leaves"}})
+        self._emit(
+            {"kind": "evaluation", **{k: v for k, v in result.items() if k != "leaves"}}
+        )
         return result
