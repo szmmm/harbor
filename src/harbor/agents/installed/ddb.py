@@ -803,6 +803,17 @@ class DDB(BaseAgent):
         self.logger.debug(f"Finally prepare meta-data for verifier {task_id} (app {app_id})")
         self.populate_context(context, task)
 
+        build = next(
+            (event.get("data", {}) for event in reversed(task.get("events", []))
+             if event.get("type") == "build_complete"),
+            {},
+        )
+        if build.get("success") is False:
+            raise RuntimeError(
+                f"preview_build_failed: task {task_id}, app {app_id}, "
+                f"mode={build.get('mode')}: {build.get('error') or 'Unknown build error'}"
+            )
+
     # ------------------------------------------------------------------
     # Headless API
     # ------------------------------------------------------------------
