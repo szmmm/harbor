@@ -33,7 +33,7 @@ class ProbeConfig:
     max_nodes: int = 60
     # The report_findings payload (a tour plus several findings, often in
     # Chinese) is the longest thing the model emits; 4096 truncated it.
-    max_output_tokens: int = 8192
+    max_output_tokens: int = 65536
     temperature: float = 0.3
     request_timeout_s: float = 180.0
     max_retries: int = 3

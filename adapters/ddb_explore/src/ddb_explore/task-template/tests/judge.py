@@ -6,9 +6,8 @@ which order, but not the checks or their weights. Each verdict must cite saved
 observations, and code checks that the citations can support it. Code, not the
 model, turns the verdicts into a score (rubric_score.py).
 
-The model records verdicts while it works, not only at the end: old screenshots
-and snapshots leave its context, so a verdict given late would rest on evidence
-that the model can no longer see.
+The model records verdicts while it works. Observation text is retained; older
+screenshots can be retrieved from saved evidence.
 """
 
 from __future__ import annotations
@@ -29,6 +28,8 @@ from source_tools import SourceTree
 SCORING = "rubric-tree-v1"
 ACTION_NAMES = {
     "click_ref",
+    "click_at",
+    "open_app",
     "type_into",
     "press_key",
     "swipe_ref",
@@ -40,8 +41,7 @@ ACTION_NAMES = {
     "set_media",
     "clear_site_data",
 }
-# Observations kept in full in the model context; older ones keep their id only.
-KEEP_FULL_OBSERVATIONS = 4
+# Retain observation text; limit only screenshots in the model context.
 KEEP_IMAGES = 3
 FINAL_TURNS = 2
 
@@ -72,8 +72,8 @@ Verdicts:
   could reach the control, or the check needs knowledge that you do not have.
   Never use UNTESTED for a feature that you looked for and did not find, or
   that you tried and that did not work.
-Record verdicts with record_verdicts as soon as you have the evidence. Old
-screenshots and snapshots leave your context, so do not wait until the end.
+Record verdicts with record_verdicts as soon as you have the evidence. Only the
+latest three screenshots stay in context; use read_evidence to revisit older ones.
 You can record several leaves in one call, and a later verdict replaces an
 earlier one. Cite the evidence ids that support each verdict.
 Call finish when every leaf has a verdict. If a critical leaf fails, you can
@@ -88,12 +88,23 @@ right control before you blame the app. To test persistence, change data, then
 reload. Do not reward features that no leaf asks for.
 
 Other tools:
+- click_at clicks viewport coordinates from the latest screenshot when a visible
+  control has no accessibility ref. Inspect the resulting state.
+- open_app opens the original preview URL: new_tab shares cookies/localStorage/
+  IndexedDB but starts new sessionStorage; reopen_tab first closes the current
+  tab with the same storage semantics. Use these for tab persistence checks.
+  fresh_context starts an isolated browser profile without prior local storage
+  or cookies; it may be a different anonymous user, not a browser restart.
+- read_evidence retrieves a saved observation and its screenshot by evidence_id.
+  It does not change the browser; old element refs are not current click targets.
+- return_to_app opens the original preview URL, preserving its path and token.
+  Use it to recover after navigation leaves the app, rather than reloading a 404.
 - set_viewport changes the window size. For a full-screen check, use a full
   screen size such as 1920x1080.
 - set_media print shows the page as it prints. set_media screen goes back.
-- clear_site_data deletes the site's cookies and browser storage, then
-  reloads. Use it as a new browser, a private window or another device: data
-  that is still there after it comes from a server.
+- clear_site_data deliberately deletes cookies and browser storage, then reloads.
+  This tests data deletion, NOT persistence after closing/reopening a tab.
+  Data reappearing alone does not prove server persistence; it may be defaults.
 - list_source_files, read_source_file and search_source read the app's source
   files. Use them for checks about the code: the framework, the files, external
   scripts or styles, where data is stored, how a value is computed. A check
@@ -133,6 +144,35 @@ FINISH_TOOL = _fn(
 )
 PAGE_TOOLS = [
     _fn(
+        "click_at",
+        "Click a visible control at viewport CSS-pixel coordinates from "
+        "the latest screenshot, especially if no accessibility ref exists.",
+        {
+            "x": {"type": "integer", "minimum": 0},
+            "y": {"type": "integer", "minimum": 0},
+        },
+        required=["x", "y"],
+    ),
+    _fn(
+        "open_app",
+        "Open the original preview URL and switch to it. new_tab keeps "
+        "the old tab; reopen_tab closes it first. Both share browser storage but "
+        "start empty sessionStorage. fresh_context replaces the current context "
+        "with an isolated profile (no prior cookies or local storage).",
+        {
+            "mode": {
+                "type": "string",
+                "enum": ["new_tab", "reopen_tab", "fresh_context"],
+            }
+        },
+        required=["mode"],
+    ),
+    _fn(
+        "return_to_app",
+        "Return to the original preview URL in the current browser.",
+        {},
+    ),
+    _fn(
         "set_viewport",
         "Resize the browser window. Use it for checks about window size or full screen.",
         {
@@ -151,10 +191,17 @@ PAGE_TOOLS = [
     _fn(
         "clear_site_data",
         "Delete this site's cookies, localStorage, sessionStorage, IndexedDB and "
-        "caches, then reload, as in a new browser or on another device.",
+        "caches, then reload. This deletes data; do not use it to test tab persistence.",
         {},
     ),
 ]
+EVIDENCE_TOOL = _fn(
+    "read_evidence",
+    "Retrieve saved evidence text and screenshot by ID, without changing the browser. "
+    "Historical element refs must not be used to click the current page.",
+    {"evidence_id": {"type": "string", "description": "An existing ID such as e0007."}},
+    required=["evidence_id"],
+)
 SOURCE_TOOLS = [
     _fn("list_source_files", "List the app's source files with their sizes.", {}),
     _fn(
@@ -315,7 +362,48 @@ class RubricJudge(ProbeAgent):
         }
         return [{"type": "text", "text": json.dumps(text, ensure_ascii=False)}]
 
+    def _read_evidence(self, args: dict) -> list[dict]:
+        eid = args.get("evidence_id")
+        record = next((row for row in self.evidence if row["id"] == eid), None)
+        if record is None:
+            raise ValueError(f"unknown evidence_id {eid!r}")
+        content = [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"evidence_id": eid, "historical": True, **record},
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+        if record["screenshot"]:
+            screenshot = (self.evidence_dir / f"{eid}.png").read_bytes()
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,"
+                        + base64.b64encode(screenshot).decode()
+                    },
+                }
+            )
+        return content
+
     async def _page_tool(self, name: str, args: dict) -> dict:
+        if name == "click_at":
+            out = await self._executor.click(args)
+            await self._env.wait_settled()
+            return out
+        if name == "open_app":
+            mode = args.get("mode")
+            if mode not in {"new_tab", "reopen_tab", "fresh_context"}:
+                raise ValueError(f"unknown open_app mode {mode!r}")
+            success = await self._env.open_app(self._app_url, mode)
+            await self._env.wait_settled()
+            return {"success": success, "text": f"Opened original preview: {mode}."}
+        if name == "return_to_app":
+            await self._env.goto(self._app_url)
+            return {"success": True}
         if name == "set_viewport":
             width = max(320, min(int(args.get("width") or 0), 2560))
             height = max(320, min(int(args.get("height") or 0), 1600))
@@ -412,6 +500,23 @@ class RubricJudge(ProbeAgent):
         missing = [leaf for leaf in leaves if leaf["id"] not in self.verdicts]
         return [leaf["id"] for leaf in sorted(missing, key=lambda l: not l["critical"])]
 
+    def _verdict_table(self, leaves: list[dict], turns_left: int) -> str:
+        rows = [
+            f"Current verdicts (authoritative; supersedes earlier tables). Turns left: {turns_left}.",
+            "Leaf | Critical | Latest verdict | Evidence",
+        ]
+        for leaf in leaves:
+            verdict = self.verdicts.get(leaf["id"], {})
+            rows.append(
+                f"{leaf['id']} | {'yes' if leaf['critical'] else 'no'} | "
+                f"{verdict.get('verdict', 'PENDING')} | "
+                f"{', '.join(verdict.get('evidence_ids', [])) or '-'}"
+            )
+        rows.append(
+            "PENDING has no recorded verdict. Revisit UNTESTED if evidence becomes available."
+        )
+        return "\n".join(rows)
+
     def _may_finish(self, leaves: list[dict]) -> bool:
         return not self._missing(leaves) or any(
             leaf["critical"]
@@ -420,22 +525,7 @@ class RubricJudge(ProbeAgent):
         )
 
     def _compact(self, messages: list[dict]) -> None:
-        """Keep recent observations in full, and only the evidence ids of older ones."""
-        for message in self._observations[:-KEEP_FULL_OBSERVATIONS]:
-            for item in message["content"]:
-                if item.get("type") != "text" or not item["text"].startswith("{"):
-                    continue  # a screenshot that was already replaced by a note
-                data = json.loads(item["text"])
-                if "omitted" in data:
-                    continue
-                item["text"] = json.dumps(
-                    {
-                        "evidence_id": data["evidence_id"],
-                        "action": data["action"],
-                        "success": data["success"],
-                        "omitted": "Older observation. The full record is saved.",
-                    }
-                )
+        """Retain all observation text and only the most recent screenshots."""
         image_count = 0
         for message in reversed(messages):
             content = message.get("content")
@@ -454,11 +544,15 @@ class RubricJudge(ProbeAgent):
             tools = [RECORD_TOOL]
             choice = {"type": "function", "function": {"name": "record_verdicts"}}
         else:
-            tools = BROWSER_TOOLS + SOURCE_TOOLS + [RECORD_TOOL, FINISH_TOOL]
+            tools = (
+                BROWSER_TOOLS + SOURCE_TOOLS + [EVIDENCE_TOOL, RECORD_TOOL, FINISH_TOOL]
+            )
             choice = "auto"
         msg = await self._request(client, messages, tools, choice)
         calls = list(msg.tool_calls or [])
         assistant = {"role": "assistant", "content": msg.content}
+        if getattr(msg, "reasoning_content", None) is not None:
+            assistant["reasoning_content"] = msg.reasoning_content
         if calls:
             assistant["tool_calls"] = [call.model_dump() for call in calls]
         messages.append(assistant)
@@ -489,6 +583,9 @@ class RubricJudge(ProbeAgent):
                         )
                     self.summary = str(args.get("summary") or "")
                     finished, reply = True, "Finished."
+                elif name == "read_evidence":
+                    observations.extend(self._read_evidence(args))
+                    reply = f"Retrieved historical evidence {args['evidence_id']}. Browser unchanged."
                 elif name in SOURCE_NAMES:
                     outcome = self._source_tool(name, args)
                     observations.extend(self._observe_source(name, args, outcome))
@@ -496,7 +593,14 @@ class RubricJudge(ProbeAgent):
                 elif name in BROWSER_NAMES:
                     if name == "take_screenshot":
                         outcome = {"success": True}
-                    elif name in {"set_viewport", "set_media", "clear_site_data"}:
+                    elif name in {
+                        "set_viewport",
+                        "set_media",
+                        "clear_site_data",
+                        "return_to_app",
+                        "click_at",
+                        "open_app",
+                    }:
                         outcome = await self._page_tool(name, args)
                     else:
                         outcome = await self._dispatch(name, args)
@@ -523,11 +627,13 @@ class RubricJudge(ProbeAgent):
         min_coverage: float = 0.9,
     ) -> dict[str, Any]:
         started = time.monotonic()
+        self._app_url = app_url
         leaves = flatten(rubric["tree"])
         by_id = {leaf["id"]: leaf for leaf in leaves}
         spec = rubric.get("spec") or {}
         task = {
             "request": rubric["prompt"],
+            "app_url": app_url,
             "user_today": (spec.get("time_frame") or {}).get("date")
             or rubric.get("as_of"),
             "evaluation_date": datetime.date.today().isoformat(),
@@ -565,13 +671,12 @@ class RubricJudge(ProbeAgent):
             for step in range(self._cfg.max_steps):
                 if time.monotonic() - started > self.deadline_s:
                     break
-                missing = self._missing(leaves)
                 messages.append(
                     {
                         "role": "user",
-                        "content": f"Browser turns left: {self._cfg.max_steps - step}. "
-                        f"Leaves with a verdict: {len(leaves) - len(missing)} of {len(leaves)}. "
-                        f"Without a verdict: {', '.join(missing) or 'none'}.",
+                        "content": self._verdict_table(
+                            leaves, self._cfg.max_steps - step
+                        ),
                     }
                 )
                 if await self._turn(client, messages, leaves, by_id, step, final=False):
@@ -584,7 +689,8 @@ class RubricJudge(ProbeAgent):
                 messages.append(
                     {
                         "role": "user",
-                        "content": "The browser budget has ended. From the evidence that you "
+                        "content": self._verdict_table(leaves, 0)
+                        + "\nThe browser budget has ended. From the evidence that you "
                         "have, record a verdict for each of these leaves. Use UNTESTED where "
                         f"the evidence is not enough: {', '.join(missing)}.",
                     }

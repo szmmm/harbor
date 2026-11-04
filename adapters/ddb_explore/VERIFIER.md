@@ -83,6 +83,11 @@ Screenshots and tool results are saved under `evidence/`. Verdicts, scores and
 per-leaf results are saved in `explore-report.json`. The event trace is
 `explore.trace.jsonl`.
 
+The trace logs the initial context once, then only newly appended incoming
+messages at each `judge_request`; judge outputs remain in `judge_response`.
+Screenshots in logged messages reference `evidence/<id>.png` instead of inline
+image data. These are readable turn logs, not full request snapshots.
+
 `VLM_REWARD_ENABLED` and `TRAJECTORY_REWARD_ENABLED` accept 0 or 1. Both default
 to 1, which uses the mean of the two scores. One enabled component uses that
 score alone. Both disabled is invalid. Missing enabled scores invalidate the
@@ -100,3 +105,17 @@ entry point with that flag also exits without reading or scoring a trajectory.
 - `fact` leaves rely on the judge model's own knowledge. It has no web search.
 - The judge is one sample at temperature 0 (or the server default when
   `VLM_OMIT_TEMPERATURE=1`). Verdict noise is not measured yet.
+
+The judge preserves returned `reasoning_content` in subsequent requests. It can
+use `read_evidence(evidence_id)` to retrieve saved text and screenshots without
+changing the browser, and `return_to_app()` to reopen the original preview URL.
+Retrieved screenshots join the same three-image context window.
+
+`click_at(x, y)` uses viewport CSS-pixel coordinates for controls absent from
+the accessibility snapshot. `open_app(mode)` opens the original preview in a
+`new_tab`, closes/reopens the current tab (`reopen_tab`), or replaces the browser
+context with an isolated profile (`fresh_context`). The first two retain cookies,
+localStorage and IndexedDB but start empty sessionStorage. A fresh context may
+represent a different anonymous user; clearing storage is not a persistence test.
+Each turn receives a current table of all leaf verdicts and their evidence IDs,
+including PENDING and UNTESTED. The latest table supersedes earlier tables.

@@ -287,6 +287,21 @@ class PlaywrightEnv:
     def _on_page_created(self, page: Page) -> None:
         """Hook: attach extra listeners to every page this env opens."""
 
+    async def open_app(self, url: str, mode: str) -> bool:
+        """Open a tab or an isolated profile, without cloning sessionStorage."""
+        if mode not in {"new_tab", "reopen_tab", "fresh_context"}:
+            raise ValueError(f"Unknown open_app mode: {mode}")
+        if self._context is None:
+            raise RuntimeError("Browser not started")
+        if mode == "fresh_context":
+            context = await self._new_configured_context()
+            await self._context.close()
+            self._context = context
+        elif mode == "reopen_tab":
+            await self.page.close()
+        self._page = await self._new_configured_page(self._context)
+        return await self.goto(url)
+
     async def stop(self) -> None:
         if self._context:
             await self._context.close()

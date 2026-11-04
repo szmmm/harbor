@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -44,7 +45,28 @@ def _trace_writer(
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a", encoding="utf-8")
 
+    seen_messages = 0
+
     def sink(event: dict[str, Any]) -> None:
+        nonlocal seen_messages
+        if event.get("kind") == "judge_request":
+            messages = event["request"]["messages"]
+            incoming = copy.deepcopy(
+                [m for m in messages[seen_messages:] if m["role"] != "assistant"]
+            )
+            for message in incoming:
+                if not isinstance(message.get("content"), list):
+                    continue
+                evidence_id = None
+                for item in message["content"]:
+                    if item.get("type") == "text" and item["text"].startswith("{"):
+                        evidence_id = json.loads(item["text"]).get("evidence_id", evidence_id)
+                    elif item.get("type") == "image_url":
+                        item.clear()
+                        item.update(type="image_reference", path=f"evidence/{evidence_id}.png")
+            event = {k: v for k, v in event.items() if k != "request"}
+            event["messages"] = incoming
+            seen_messages = len(messages)
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         handle.flush()
 
@@ -109,9 +131,10 @@ def start_dev_server() -> tuple[subprocess.Popen[str], str] | None:
     return process, detected[0]
 
 
-def wait_for_app_ready(url: str, timeout: float) -> bool:
-    """Wait until a remote preview serves application HTML."""
+def wait_for_app_ready(url: str, timeout: float) -> str | None:
+    """Return the readiness failure reason, or None when ready."""
     deadline = time.monotonic() + timeout
+    last_error = "No readiness attempt completed"
     while time.monotonic() < deadline:
         try:
             request = Request(url, headers={"User-Agent": "ddb-exploratory-probe"})
@@ -121,12 +144,17 @@ def wait_for_app_ready(url: str, timeout: float) -> bool:
                     "__deepdiver_ready" in body or "Finalizing your app" in body
                 )
                 if response.status == 200 and body and not placeholder:
-                    return True
-        except Exception:
-            pass
-        time.sleep(3)
-    print(f"WARNING: app did not become ready within {timeout:.0f}s")
-    return False
+                    return None
+                reason = "publishing placeholder" if placeholder else "empty response body"
+                last_error = f"HTTP {response.status}: {reason}"
+        except Exception as exc:
+            # URLs can contain preview tokens; keep them out of failure reports.
+            detail = re.sub(r"https?://[^\s<>\"']+", "<URL redacted>", str(exc))
+            last_error = f"{type(exc).__name__}: {detail[:300]}"
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
+    error = f"Preview readiness timed out after {timeout:.0f}s; last check: {last_error}"
+    print(error, flush=True)
+    return error
 
 
 async def run_probe(
@@ -236,12 +264,13 @@ def main() -> int:
     process = None
     if override_url:
         app_url = override_url
-        if not wait_for_app_ready(app_url, APP_READY_TIMEOUT):
+        readiness_error = wait_for_app_ready(app_url, APP_READY_TIMEOUT)
+        if readiness_error is not None:
             _write_report(
                 {
                     "status": "app_unavailable",
                     "score": None,
-                    "error": "Preview readiness timed out",
+                    "error": readiness_error,
                 }
             )
             return 1

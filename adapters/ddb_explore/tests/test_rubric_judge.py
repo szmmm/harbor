@@ -335,9 +335,17 @@ class FakeClient:
             )
             for n, (name, args) in enumerate(calls)
         ]
-        message = SimpleNamespace(content=None, tool_calls=tool_calls)
+        message = SimpleNamespace(
+            content=None,
+            tool_calls=tool_calls,
+            reasoning_content="Plan preserved verbatim.",
+        )
         usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=usage,
+            model_dump=lambda **kwargs: {},
+        )
 
     def close(self):
         pass
@@ -486,7 +494,7 @@ def test_judge_without_verdicts_has_no_score(tmp_path):
     assert result["status"] == "incomplete" and result["score"] is None
 
 
-def test_old_observations_lose_snapshots(tmp_path):
+def test_old_observations_keep_text_and_limit_images(tmp_path):
     script = [[("click_ref", {"ref": 0})] for _ in range(7)]
     result, client = run_judge(tmp_path, script, max_steps=7)
     texts = [
@@ -496,8 +504,8 @@ def test_old_observations_lose_snapshots(tmp_path):
         for item in m["content"]
         if item["type"] == "text" and item["text"].startswith("{")
     ]
-    # The open page and 7 clicks: the 4 most recent keep their snapshots.
-    assert [("snapshot" in t) for t in texts] == [False] * 4 + [True] * 4
+    # The open page and 7 clicks retain all snapshot text.
+    assert all("snapshot" in t for t in texts)
     images = [
         item
         for m in client.requests[-1]["messages"]
@@ -581,3 +589,96 @@ def test_adapter_writes_rubric_tasks(tmp_path):
         "instruction": RUBRIC["prompt"],
         "metadata": {"task_id": "ddb-explore-mob_1"},
     }
+
+
+def test_reasoning_and_retrieved_evidence_reach_next_request(tmp_path):
+    script = [[("click_ref", {"ref": 0})] for _ in range(4)]
+    script += [[("read_evidence", {"evidence_id": "e0000"})]]
+    result, client = run_judge(tmp_path, script, max_steps=5)
+    messages = client.requests[-1]["messages"]
+    assistants = [m for m in messages if m["role"] == "assistant"]
+    assert all(m["reasoning_content"] == "Plan preserved verbatim." for m in assistants)
+    historical = [
+        m
+        for m in messages
+        if isinstance(m["content"], list)
+        and any(
+            i.get("type") == "text" and '"historical": true' in i["text"]
+            for i in m["content"]
+        )
+    ]
+    assert len(historical) == 1
+    assert json.loads(historical[0]["content"][0]["text"])["evidence_id"] == "e0000"
+    assert historical[0]["content"][1]["type"] == "image_url"
+    assert len(result["evidence"]) == 5  # Retrieval creates no new evidence/action.
+
+
+def test_return_to_app_uses_original_url_and_unknown_evidence_is_rejected(
+    tmp_path, monkeypatch
+):
+    urls = []
+
+    async def goto(self, url):
+        urls.append(url)
+        self.url = url
+
+    monkeypatch.setattr(FakeEnv, "goto", goto)
+    script = [
+        [("read_evidence", {"evidence_id": "../../outside"})],
+        [("return_to_app", {})],
+    ]
+    result, client = run_judge(tmp_path, script, max_steps=2)
+    assert urls == ["http://app", "http://app"]
+    assert [e["action"] for e in result["evidence"]] == ["open", "return_to_app"]
+    assert any(
+        "unknown evidence_id" in m["content"]
+        for m in client.requests[1]["messages"]
+        if m["role"] == "tool"
+    )
+
+
+def test_current_verdict_table_replaces_revised_verdict(tmp_path):
+    script = [
+        [("record_verdicts", {"verdicts": [verdict("S.1.1", "FAIL", "e0000")]})],
+        [("record_verdicts", {"verdicts": [verdict("S.1.1", "PASS", "e0000")]})],
+    ]
+    _, client = run_judge(tmp_path, script, max_steps=2)
+    latest = client.requests[2]["messages"][-1]["content"]
+    assert "S.1.1 | no | PASS | e0000" in latest
+    assert "S.1.1 | no | FAIL" not in latest
+    assert "I.1 | yes | PENDING | -" in latest
+
+
+def test_coordinate_click_and_persistence_tools(tmp_path, monkeypatch):
+    clicks, opens = [], []
+
+    async def click(self, args):
+        clicks.append(args)
+        return {"success": True}
+
+    async def open_app(self, url, mode):
+        opens.append((url, mode))
+        return True
+
+    monkeypatch.setattr(FakeExecutor, "click", click)
+    monkeypatch.setattr(FakeEnv, "open_app", open_app, raising=False)
+    script = [
+        [("click_at", {"x": 310, "y": 207})],
+        [("open_app", {"mode": "reopen_tab"})],
+        [
+            (
+                "record_verdicts",
+                {
+                    "verdicts": [
+                        verdict("I.1", "PASS", "e0001"),
+                        verdict("D.C.1", "PASS", "e0002"),
+                    ]
+                },
+            )
+        ],
+    ]
+    result, _ = run_judge(tmp_path, script, max_steps=3)
+    assert clicks == [{"x": 310, "y": 207}]
+    assert opens == [("http://app", "reopen_tab")]
+    assert result["leaves"][0]["verdict"] == "PASS"
+    assert result["leaves"][-1]["verdict"] == "PASS"
