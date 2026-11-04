@@ -47,6 +47,7 @@ from harbor.environments.docker.compose_env import (
     legacy_log_mount_env_vars,
     merge_compose_env,
 )
+from harbor.environments.docker.network_pool import NetworkPool
 from harbor.environments.docker.utils import (
     default_docker_platform,
     docker_image_exists,
@@ -185,6 +186,28 @@ class DockerEnvironment(BaseEnvironment):
         self._is_windows_container = task_env_config.os == TaskOS.WINDOWS
         startup_network_policy = network_policy or NetworkPolicy(
             network_mode=NetworkMode.PUBLIC
+        )
+        policies = [startup_network_policy, *phase_network_policies]
+        self._network_pool = NetworkPool.from_env(session_id)
+        self._network_compose_path: Path | None = None
+        if self._network_pool is not None and (
+            self._is_windows_container
+            or any(policy.network_mode != NetworkMode.PUBLIC for policy in policies)
+            or (environment_dir / "docker-compose.yaml").exists()
+            or kwargs.get("extra_docker_compose_paths")
+        ):
+            raise ValueError(
+                "HARBOR_DOCKER_SUBNET_POOL supports only Linux public-network tasks "
+                "without custom Compose files"
+            )
+        self._native_no_network = (
+            os.environ.get("HARBOR_DOCKER_NATIVE_NO_NETWORK") == "1"
+            and not self._is_windows_container
+            and all(
+                policy.network_mode == NetworkMode.NO_NETWORK for policy in policies
+            )
+            and not (environment_dir / "docker-compose.yaml").exists()
+            and not kwargs.get("extra_docker_compose_paths")
         )
         self._enable_egress_control = (
             not self._is_windows_container
@@ -376,6 +399,11 @@ class DockerEnvironment(BaseEnvironment):
             paths.append(self._DOCKER_COMPOSE_EGRESS_CONTROL_PATH)
             if self._egress_control_services_compose_path:
                 paths.append(self._egress_control_services_compose_path)
+        elif self._native_no_network:
+            paths.append(self._DOCKER_COMPOSE_NO_NETWORK_PATH)
+
+        if self._network_compose_path is not None:
+            paths.append(self._network_compose_path)
 
         return paths
 
@@ -917,20 +945,60 @@ class DockerEnvironment(BaseEnvironment):
         except RuntimeError:
             pass
 
-        # Build resolution is complete above. Do not let `up` invoke a second build.
-        await self._run_docker_compose_command(
-            ["up", "--detach", "--wait", "--no-build"]
-        )
+        try:
+            if self._network_pool is not None:
+                await self._network_pool.allocate()
+                self._network_compose_path = (
+                    self.trial_paths.trial_dir / "docker-network.json"
+                )
+                self._network_compose_path.write_text(
+                    json.dumps(self._network_pool.compose_config())
+                )
+                self.logger.debug(
+                    "Allocated %s on %s",
+                    self._network_pool.subnet,
+                    self._network_pool.name,
+                )
+            # Build resolution is complete above. Do not let `up` invoke a second build.
+            await self._run_docker_compose_command(
+                ["up", "--detach", "--wait", "--no-build"]
+                + (["--pull", "never"] if image_cache is not None else [])
+            )
 
-        # Auto-create + chmod each writable mount target inside the container.  Bind
-        # mounts auto-create the target as part of the mount, so mkdir is
-        # generally a no-op, but chmod makes the dir writable for non-root
-        # agent/verifier users.  Skipped for Windows containers which use
-        # ACLs rather than POSIX permissions.
-        if not self._is_windows_container:
-            await self.ensure_dirs(self._mount_targets(writable_only=True))
+            # Auto-create + chmod each writable mount target inside the container.  Bind
+            # mounts auto-create the target as part of the mount, so mkdir is
+            # generally a no-op, but chmod makes the dir writable for non-root
+            # agent/verifier users.  Skipped for Windows containers which use
+            # ACLs rather than POSIX permissions.
+            if not self._is_windows_container:
+                await self.ensure_dirs(self._mount_targets(writable_only=True))
 
-        await self._upload_environment_dir_after_start()
+            await self._upload_environment_dir_after_start()
+        except BaseException:
+            if self._network_pool is not None:
+                await asyncio.shield(self._cleanup_failed_network_start())
+            raise
+
+    async def _cleanup_failed_network_start(self) -> None:
+        try:
+            await self._run_docker_compose_command(["down", "--remove-orphans"])
+        except (RuntimeError, OSError):
+            self.logger.exception("Failed to remove containers after network startup failure")
+        await self._release_trial_network()
+
+    async def _release_trial_network(self) -> None:
+        if self._network_pool is None:
+            return
+        try:
+            await self._network_pool.release()
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            self.logger.exception(
+                "Network cleanup failed; retained network %s", self._network_pool.name
+            )
+        else:
+            if self._network_compose_path is not None:
+                self._network_compose_path.unlink(missing_ok=True)
+                self._network_compose_path = None
 
     @override
     async def prepare_logs_for_host(self) -> None:
@@ -977,6 +1045,8 @@ class DockerEnvironment(BaseEnvironment):
                 except Exception as e:
                     self.logger.warning(f"Docker compose down failed: {e}")
         finally:
+            if not self._keep_containers:
+                await asyncio.shield(self._release_trial_network())
             self._cleanup_mounts_compose_file()
             self._cleanup_resources_compose_file()
             self._cleanup_env_compose_file()
@@ -1252,6 +1322,12 @@ class DockerEnvironment(BaseEnvironment):
             else ""
         )
 
+        cleanup_network = (
+            " && docker network rm " + shlex.quote(self._network_pool.name)
+            if self._network_pool is not None and self._network_pool.subnet is not None
+            else ""
+        )
+
         os.execvp(
             "bash",
             [
@@ -1261,6 +1337,7 @@ class DockerEnvironment(BaseEnvironment):
                 + " ".join(compose_base + ["exec", "-it", "main", "bash"])
                 + "; "
                 + " ".join(compose_base + ["down"])
+                + cleanup_network
                 + cleanup_mounts_compose,
             ],
         )
