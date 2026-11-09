@@ -38,6 +38,8 @@ run harbor run -d webgen-bench/webgen-bench \
 """
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -96,7 +98,8 @@ PREVIEW_URL_SANDBOX_PATH = "/tmp/harbor_preview_url"
 SOURCE_CODES_SANDBOX_PATH = "/tmp/DDB_App_source_codes.txt"
 TRAJECTORY_SANDBOX_PATH = "/tmp/harbor_trajectory.json"
 WORKSPACE_SANDBOX_PATH = "/app/workspace"
-WORKSPACE_EXCLUDE_PATTERN = r"^\.git/|^node_modules/|^dist/|^tool_call_logs/"
+# Keep application sources/assets; Next.js build intermediates are disposable.
+WORKSPACE_EXCLUDE_PATTERN = r"^\.git/|^node_modules/|^dist/|^tool_call_logs/|^\.next/"
 
 
 logger: logging.Logger = global_logger.getChild(__name__)
@@ -409,6 +412,33 @@ def _iter_file_paths(nodes: list[dict[str, Any]] | None) -> Iterator[str]:
         if node.get("type") == "file":
             yield node["path"]
         yield from _iter_file_paths(node.get("children"))
+
+
+def _decode_workspace_content(payload: dict[str, Any], path: str) -> bytes:
+    """Decode explicit API encodings; detect legacy Base64 gzip archives only."""
+    content = payload.get("content")
+    if not isinstance(content, str):
+        raise TypeError(f"Workspace file {path}: expected string content")
+    encoding = str(payload.get("encoding") or "utf-8").lower()
+    if encoding == "base64":
+        try:
+            return base64.b64decode(content, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError(f"Workspace file {path}: invalid base64") from exc
+    if encoding not in {"utf-8", "utf8", "text"}:
+        raise ValueError(f"Workspace file {path}: unsupported encoding {encoding}")
+    # Older file-read responses can omit encoding for binary package archives.
+    # Never guess for text files: ordinary source text may itself look like Base64.
+    if path.endswith((".tgz", ".tar.gz")):
+        try:
+            decoded = base64.b64decode(content, validate=True)
+            if decoded.startswith(b"\x1f\x8b"):
+                with tarfile.open(fileobj=BytesIO(decoded), mode="r:gz") as archive:
+                    archive.getmembers()
+                return decoded
+        except (ValueError, binascii.Error, tarfile.TarError, EOFError, OSError):
+            pass
+    return content.encode("utf-8")
 
 
 def _unpack_workspace_archive(archive: bytes, dest: Path) -> None:
@@ -888,20 +918,14 @@ class DDB(BaseAgent):
                 f"Published DDB trajectories to sandbox {TRAJECTORY_SANDBOX_PATH}"
             )
 
-        # Auto-inject DDB's preview URL so a URL-based verifier can target the remote app.
-        if self._publish_preview_url:
-            preview_url = self._public_preview_url(
-                (task.get("result") or {}).get("preview_url")
-            )
-            if preview_url:
-                source_codes = get_source_codes_from_trajectories(trajectories)
-                await self.push_data_to_sandbox(
-                    environment, app_id, preview_url, source_codes
-                )
-            else:
-                self.logger.warning(
-                    f"DDB task {task_id} produced no preview URL; verifier falls back to local boot"
-                )
+        # Sources are needed even when preview publication is disabled or unavailable.
+        preview_url = (
+            self._public_preview_url((task.get("result") or {}).get("preview_url"))
+            if self._publish_preview_url
+            else None
+        )
+        source_codes = get_source_codes_from_trajectories(trajectories)
+        await self.push_data_to_sandbox(environment, app_id, preview_url, source_codes)
 
         self.logger.debug(
             f"Finally prepare meta-data for verifier {task_id} (app {app_id})"
@@ -1118,7 +1142,6 @@ class DDB(BaseAgent):
         )
         return failure
 
-
     async def _fetch_task(
         self, client: httpx.AsyncClient, task_id: str, attempts: int = 3
     ) -> dict[str, Any] | None:
@@ -1293,7 +1316,7 @@ class DDB(BaseAgent):
         self,
         environment: BaseEnvironment,
         app_id: str | None,
-        preview_url: str,
+        preview_url: str | None,
         source_codes: list[str],
     ) -> None:
         """Publish what DDB produced into the sandbox for the verifier.
@@ -1305,16 +1328,19 @@ class DDB(BaseAgent):
         the workspace itself -- the app's sources, which live on the DDB deployment
         -- is pulled over the files API and unpacked into ``WORKSPACE_SANDBOX_PATH``.
         """
-        # 1. Upload preview URL
-        marker = self.logs_dir / "preview_url.txt"
-        marker.write_text(preview_url)
-        try:
-            await environment.upload_file(marker, PREVIEW_URL_SANDBOX_PATH)
-            self.logger.debug(
-                f"Published DDB preview URL to sandbox {PREVIEW_URL_SANDBOX_PATH}"
-            )
-        except Exception as exc:
-            self.logger.warning(f"Failed to publish DDB preview URL to sandbox: {exc}")
+        # 1. Publish a preview only when enabled and available.
+        if preview_url is not None and preview_url != "":
+            marker = self.logs_dir / "preview_url.txt"
+            marker.write_text(preview_url)
+            try:
+                await environment.upload_file(marker, PREVIEW_URL_SANDBOX_PATH)
+                self.logger.debug(
+                    f"Published DDB preview URL to sandbox {PREVIEW_URL_SANDBOX_PATH}"
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Failed to publish DDB preview URL to sandbox: {exc}"
+                )
         # 2. Upload source code list
         marker = self.logs_dir / "source_codes.txt"
         marker.write_text("\n".join(source_codes))
@@ -1446,7 +1472,7 @@ class DDB(BaseAgent):
                 continue
             targets.append((path, destination))
 
-        contents: list[str | None] = [None] * len(targets)
+        contents: list[bytes | None] = [None] * len(targets)
         semaphore = asyncio.Semaphore(self.WORKSPACE_READ_CONCURRENCY)
 
         async def read_into(index: int, path: str) -> None:
@@ -1467,7 +1493,7 @@ class DDB(BaseAgent):
                 )
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(content, encoding="utf-8")
+            destination.write_bytes(content)
             written += 1
         self.logger.debug(
             f"Pulled {written}/{len(targets)} DDB workspace files to {local_dir}"
@@ -1476,19 +1502,20 @@ class DDB(BaseAgent):
 
     async def _read_workspace_file(
         self, client: httpx.AsyncClient, files_url: str, path: str
-    ) -> str | None:
-        """One file's text, or ``None`` when DDB will not serve it."""
+    ) -> bytes | None:
+        """Return original file bytes, honoring the files API encoding."""
         for params in ({"path": path}, {"path": path, "mode": "browse"}):
             try:
                 response = await client.get(f"{files_url}/read", params=params)
                 if response.status_code >= 400:
                     continue
-                content = response.json().get("content")
+                payload = response.json()
+                content = payload.get("content")
             except (httpx.HTTPError, ValueError) as exc:
                 self.logger.debug(f"Reading DDB workspace file {path} failed: {exc}")
                 continue
             if content is not None:
-                return content
+                return _decode_workspace_content(payload, path)
         return None
 
     # ------------------------------------------------------------------

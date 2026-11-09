@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import subprocess
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
@@ -20,8 +19,8 @@ from urllib.request import Request, urlopen
 
 from browser_env import PlaywrightEnv, resolve_device
 from judge import RubricJudge
+from local_app import LocalAppError, start_local_app, stop_process
 from probe import ProbeConfig
-
 
 APP_SPEC_PATH = Path("/tests/app_spec.json")
 RUBRIC_PATH = Path("/tests/rubric.json")
@@ -60,10 +59,14 @@ def _trace_writer(
                 evidence_id = None
                 for item in message["content"]:
                     if item.get("type") == "text" and item["text"].startswith("{"):
-                        evidence_id = json.loads(item["text"]).get("evidence_id", evidence_id)
+                        evidence_id = json.loads(item["text"]).get(
+                            "evidence_id", evidence_id
+                        )
                     elif item.get("type") == "image_url":
                         item.clear()
-                        item.update(type="image_reference", path=f"evidence/{evidence_id}.png")
+                        item.update(
+                            type="image_reference", path=f"evidence/{evidence_id}.png"
+                        )
             event = {k: v for k, v in event.items() if k != "request"}
             event["messages"] = incoming
             seen_messages = len(messages)
@@ -81,54 +84,14 @@ def _write_report(report: dict[str, Any]) -> None:
     )
 
 
-def start_dev_server() -> tuple[subprocess.Popen[str], str] | None:
-    """Start the generated app and return its process and local URL."""
-    package_json = APP_DIR / "package.json"
-    if not package_json.is_file():
-        print(f"ERROR: {package_json} not found")
-        return None
-    try:
-        package = json.loads(package_json.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(f"ERROR: cannot read package.json: {exc}")
-        return None
-    scripts = package.get("scripts") or {}
-    if "dev" in scripts:
-        command = ["npm", "run", "dev"]
-    elif "start" in scripts:
-        command = ["npm", "run", "start"]
-    else:
-        print("ERROR: package.json has no dev or start script")
-        return None
-
-    subprocess.run(["npm", "install"], cwd=APP_DIR, check=True, timeout=120)
-    process = subprocess.Popen(
-        command,
-        cwd=APP_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+def start_dev_server():
+    return start_local_app(
+        APP_DIR,
+        REPORT_PATH.parent / "local-app.log",
+        wait_for_app_ready,
+        startup_timeout=DEV_SERVER_STARTUP_TIMEOUT,
+        install_timeout=float(os.environ.get("APP_INSTALL_TIMEOUT", "300")),
     )
-    ready = threading.Event()
-    detected: list[str] = []
-    url_pattern = re.compile(r"https?://(?:localhost|127\.0\.0\.1):(\d+)")
-
-    def read_output() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            match = url_pattern.search(line)
-            if match and not ready.is_set():
-                detected.append(f"http://localhost:{match.group(1)}")
-                ready.set()
-
-    threading.Thread(target=read_output, daemon=True).start()
-    if not ready.wait(DEV_SERVER_STARTUP_TIMEOUT):
-        process.terminate()
-        print("ERROR: app dev server did not publish a local URL")
-        return None
-    return process, detected[0]
 
 
 def wait_for_app_ready(url: str, timeout: float) -> str | None:
@@ -145,14 +108,18 @@ def wait_for_app_ready(url: str, timeout: float) -> str | None:
                 )
                 if response.status == 200 and body and not placeholder:
                     return None
-                reason = "publishing placeholder" if placeholder else "empty response body"
+                reason = (
+                    "publishing placeholder" if placeholder else "empty response body"
+                )
                 last_error = f"HTTP {response.status}: {reason}"
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             # URLs can contain preview tokens; keep them out of failure reports.
             detail = re.sub(r"https?://[^\s<>\"']+", "<URL redacted>", str(exc))
             last_error = f"{type(exc).__name__}: {detail[:300]}"
         time.sleep(min(3, max(0, deadline - time.monotonic())))
-    error = f"Preview readiness timed out after {timeout:.0f}s; last check: {last_error}"
+    error = (
+        f"Preview readiness timed out after {timeout:.0f}s; last check: {last_error}"
+    )
     print(error, flush=True)
     return error
 
@@ -262,54 +229,66 @@ def main() -> int:
     rubric = json.loads(RUBRIC_PATH.read_text(encoding="utf-8"))
     override_url = os.environ.get("APP_BASE_URL", "").strip()
     process = None
-    if override_url:
+    report: dict[str, Any]
+    preview_error = None
+    execution_source = "remote_preview" if override_url else "local_workspace"
+    try:
         app_url = override_url
-        readiness_error = wait_for_app_ready(app_url, APP_READY_TIMEOUT)
-        if readiness_error is not None:
-            _write_report(
-                {
-                    "status": "app_unavailable",
-                    "score": None,
-                    "error": readiness_error,
-                }
-            )
-            return 1
-    else:
-        started = start_dev_server()
-        if started is None:
-            _write_report(
-                {
+        if override_url:
+            preview_error = wait_for_app_ready(override_url, APP_READY_TIMEOUT)
+        if not override_url or preview_error is not None:
+            execution_source = "local_workspace"
+            if preview_error is not None:
+                print(
+                    "Remote preview unavailable; trying downloaded workspace",
+                    flush=True,
+                )
+            try:
+                process, app_url = start_dev_server()
+            except (
+                LocalAppError,
+                OSError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as exc:
+                report = {
                     "status": "app_unavailable",
                     "scoring": "disabled",
-                    "error": "dev server did not start",
+                    "score": None,
+                    "error": re.sub(
+                        r"https?://[^\s<>\"']+",
+                        "<URL redacted>",
+                        f"{type(exc).__name__}: {exc}",
+                    ),
+                    "execution_source": execution_source,
+                    "preview_readiness_error": preview_error,
                     "findings": [],
                 }
-            )
-            return 1
-        process, app_url = started
-
-    try:
+                _write_report(report)
+                return 1
         try:
             report = asyncio.run(run_probe(app_url, app_spec, rubric))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
             report = {
                 "status": "evaluator_failed",
                 "scoring": "disabled",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": re.sub(
+                    r"https?://[^\s<>\"']+",
+                    "<URL redacted>",
+                    f"{type(exc).__name__}: {exc}",
+                ),
                 "findings": [],
                 "trace_path": str(TRACE_PATH),
             }
+        report["execution_source"] = execution_source
+        report["preview_readiness_error"] = preview_error
         _write_report(report)
         status = str(report.get("status") or "evaluator_failed")
         print(f"=== Exploratory probe report: {REPORT_PATH} ({status}) ===")
         return 0 if status == "completed" else 1
     finally:
         if process is not None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            stop_process(process)
 
 
 if __name__ == "__main__":

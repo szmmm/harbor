@@ -16,5 +16,7 @@ RUN pip install --no-cache-dir \
     "playwright>=1.60" \
     && playwright install --with-deps chromium
 
+RUN npm install --global pnpm@10.20.0 yarn@1.22.22
+
 WORKDIR /app
 RUN git init /app
