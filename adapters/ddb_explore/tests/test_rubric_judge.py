@@ -489,9 +489,9 @@ def test_page_and_source_tools_record_evidence(tmp_path):
     assert result["evidence"][3]["screenshot"] is None
     # D.B.1 is an interaction leaf: a PASS citing only the landing page is rejected.
     assert result["leaves"][3]["verdict"] == "UNKNOWN"
-    assert result["status"] == "incomplete" and result["coverage"] == pytest.approx(
-        4 / 5
-    )
+    assert result["status"] == "evaluator_failed" and result[
+        "coverage"
+    ] == pytest.approx(4 / 5)
     source = json.loads((tmp_path / "evidence/e0003.json").read_text())
     assert "index.html:1:" in source["outcome"]["text"]
 
@@ -512,7 +512,6 @@ def test_judge_loop_scores_recorded_verdicts(tmp_path):
                 },
             )
         ],
-        [("finish", {"summary": "too early"})],
         [
             ("reload", {}),
             ("record_verdicts", {"verdicts": [verdict("D.C.1", "PASS", "e0003")]}),
@@ -532,9 +531,6 @@ def test_judge_loop_scores_recorded_verdicts(tmp_path):
     ]
     assert len(result["evidence"]) == 4
     assert not list((tmp_path / "evidence").glob("*.png"))
-    # The early finish was refused with the leaves that still need a verdict.
-    refused = [m for m in client.requests[3]["messages"] if m["role"] == "tool"][-1]
-    assert "D.C.1" in refused["content"]
     task = json.loads(client.requests[0]["messages"][1]["content"].split("\n")[0])
     assert task["user_today"] == "2026-10-24" and task["leaves"][0]["critical"] is True
 
@@ -565,7 +561,7 @@ def test_judge_forces_verdicts_when_budget_ends(tmp_path):
 def test_judge_without_verdicts_has_no_score(tmp_path):
     result, client = run_judge(tmp_path, [], max_steps=1)
     assert len(client.requests) == 1 + FINAL_TURNS
-    assert result["status"] == "incomplete" and result["score"] is None
+    assert result["status"] == "evaluator_failed" and result["score"] is None
 
 
 def test_old_observations_keep_text_and_limit_images(tmp_path):
@@ -724,6 +720,21 @@ def test_current_verdict_table_replaces_revised_verdict(tmp_path):
     assert "S.1.1 | no | PASS | e0000" in latest
     assert "S.1.1 | no | FAIL" not in latest
     assert "I.1 | yes | PENDING | -" in latest
+    previous_history = []
+    for request in client.requests:
+        messages = request["messages"]
+        tables = [
+            m
+            for m in messages
+            if m["role"] == "user"
+            and isinstance(m["content"], str)
+            and m["content"].startswith("Current verdicts (authoritative;")
+        ]
+        assert len(tables) == 1
+        assert sum(m["role"] == "system" for m in messages) == 1
+        history = [m for m in messages if m not in tables]
+        assert history[: len(previous_history)] == previous_history
+        previous_history = history
 
 
 def test_coordinate_click_and_persistence_tools(tmp_path, monkeypatch):
@@ -759,3 +770,114 @@ def test_coordinate_click_and_persistence_tools(tmp_path, monkeypatch):
     assert opens == [("http://app", "reopen_tab")]
     assert result["leaves"][0]["verdict"] == "PASS"
     assert result["leaves"][-1]["verdict"] == "PASS"
+
+
+def test_exploration_timeout_fails_without_finalization(tmp_path, monkeypatch):
+    import httpx
+    from openai import APITimeoutError
+
+    monkeypatch.setenv("VLM_REQUEST_RETRIES", "0")
+    result, client = run_judge(
+        tmp_path,
+        [
+            [("click_ref", {"ref": 0})],
+            APITimeoutError(request=httpx.Request("POST", "http://judge")),
+        ],
+    )
+    assert result["status"] == "evaluator_failed" and result["score"] is None
+    assert len(client.requests) == 2
+
+
+def test_finish_ends_immediately_without_finalization(tmp_path):
+    result, client = run_judge(tmp_path, [[("finish", {"summary": "done"})]])
+    assert result["finished_by_model"] and result["score"] is None
+    assert result["status"] == "evaluator_failed"
+    assert len(client.requests) == 1
+
+
+def test_critical_fail_does_not_stop_exploration(tmp_path):
+    result, client = run_judge(
+        tmp_path,
+        [
+            [("record_verdicts", {"verdicts": [verdict("I.1", "FAIL", "e0000")]})],
+            [("click_ref", {"ref": 0})],
+            [
+                (
+                    "record_verdicts",
+                    {"verdicts": [verdict(i, "UNKNOWN") for i in IDS[1:]]},
+                )
+            ],
+        ],
+        max_steps=2,
+    )
+    assert result["score"] == 0
+    assert len(result["evidence"]) == 2 and len(client.requests) == 3
+
+
+def test_finalization_revisits_unknown_and_repairs_rejected(tmp_path):
+    result, client = run_judge(
+        tmp_path,
+        [
+            [
+                ("click_ref", {"ref": 0}),
+                ("record_verdicts", {"verdicts": [verdict(i, "UNKNOWN") for i in IDS]}),
+            ],
+            [
+                (
+                    "record_verdicts",
+                    {
+                        "verdicts": [verdict(i, "PASS", "e0001") for i in IDS[:-1]]
+                        + [verdict(IDS[-1], "BAD")]
+                    },
+                )
+            ],
+            [("record_verdicts", {"verdicts": [verdict(IDS[-1], "PASS", "e0001")]})],
+        ],
+        max_steps=1,
+    )
+    assert result["score"] == 1 and len(client.requests) == 3
+    assert "D.C.1" in client.requests[-1]["messages"][-1]["content"]
+
+
+def test_shared_deadline_does_not_grant_extra_finalization_time(tmp_path, monkeypatch):
+    import judge as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    original = FakeClient.create
+
+    def create(self, **request):
+        result = original(self, **request)
+        clock[0] = 601.0
+        return result
+
+    monkeypatch.setattr(FakeClient, "create", create)
+    result, client = run_judge(tmp_path, [[("click_ref", {"ref": 0})]])
+    assert result["status"] == "evaluator_failed" and result["score"] is None
+    assert len(client.requests) == 1
+
+
+def test_finalization_provider_failure_has_no_reward(tmp_path, monkeypatch):
+    import httpx
+    from openai import APITimeoutError
+
+    monkeypatch.setenv("VLM_REQUEST_RETRIES", "0")
+    error = APITimeoutError(request=httpx.Request("POST", "http://judge"))
+    result, client = run_judge(tmp_path, [[], error, error], max_steps=1)
+    assert result["status"] == "evaluator_failed" and result["score"] is None
+    assert len(client.requests) == 3
+
+
+def test_finish_skips_later_calls_in_same_response(tmp_path):
+    result, client = run_judge(
+        tmp_path,
+        [
+            [
+                ("record_verdicts", {"verdicts": [verdict("I.1", "FAIL", "e0000")]}),
+                ("finish", {"summary": "done"}),
+                ("reload", {}),
+            ]
+        ],
+    )
+    assert result["score"] == 0 and result["finished_by_model"]
+    assert len(client.requests) == 1 and len(result["evidence"]) == 1

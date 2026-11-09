@@ -44,14 +44,19 @@ def _trace_writer(
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a", encoding="utf-8")
 
-    seen_messages = 0
+    # Retain references so object IDs cannot be reused after history filtering.
+    seen_messages: dict[int, dict[str, Any]] = {}
 
     def sink(event: dict[str, Any]) -> None:
         nonlocal seen_messages
         if event.get("kind") == "judge_request":
             messages = event["request"]["messages"]
             incoming = copy.deepcopy(
-                [m for m in messages[seen_messages:] if m["role"] != "assistant"]
+                [
+                    m
+                    for m in messages
+                    if id(m) not in seen_messages and m["role"] != "assistant"
+                ]
             )
             for message in incoming:
                 if not isinstance(message.get("content"), list):
@@ -69,7 +74,7 @@ def _trace_writer(
                         )
             event = {k: v for k, v in event.items() if k != "request"}
             event["messages"] = incoming
-            seen_messages = len(messages)
+            seen_messages.update((id(m), m) for m in messages)
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         handle.flush()
 

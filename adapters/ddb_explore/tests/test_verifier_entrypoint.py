@@ -81,3 +81,27 @@ def test_enabled_missing_trajectory_fails(monkeypatch):
         combine_rewards.build_rewards(
             {"status": "completed", "score": 0.75}, {"status": "missing"}
         )
+
+
+def test_trace_retains_new_observations_when_old_table_is_removed(tmp_path):
+    from test_explore import _trace_writer
+
+    sink, close = _trace_writer(tmp_path / "trace.jsonl")
+    system = {"role": "system", "content": "rules"}
+    old_table = {"role": "user", "content": "Current verdicts: old"}
+    assistant = {"role": "assistant", "content": None}
+    observation = {"role": "tool", "tool_call_id": "c1", "content": "e0001"}
+    new_table = {"role": "user", "content": "Current verdicts: new"}
+    first = [system, old_table]
+    second = [system, assistant, observation, new_table]
+    try:
+        for messages in (first, second, second):
+            sink({"kind": "judge_request", "request": {"messages": messages}})
+    finally:
+        close()
+    events = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["messages"] == first
+    assert events[1]["messages"] == [observation, new_table]
+    assert events[2]["messages"] == []  # Retry must not duplicate evidence.

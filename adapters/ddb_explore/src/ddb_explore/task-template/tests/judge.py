@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openai import APIConnectionError, APIStatusError
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 from probe import _PROBE_TOOLS, ProbeAgent, _device_block, _fn, _temperature_rejected
 from rubric_score import VERDICTS, flatten, score_tree
 from source_tools import SourceTree
@@ -46,6 +46,7 @@ ACTION_NAMES = {
 # Retain observation text; limit only screenshots in the model context.
 KEEP_IMAGES = 3
 FINAL_TURNS = 2
+FINAL_MAX_TOKENS = 16384
 
 SYSTEM_PROMPT = """You test a running app against a rubric of yes/no checks.
 The rubric was written for the user's request before the app was built.
@@ -62,8 +63,9 @@ Each leaf of the rubric is one check. verify_by tells you how to decide it:
 - fact: read the values that the app shows and compare them with what you
   know. The user's today is user_today; freshness words in the request apply
   at evaluation_date.
-A critical leaf is a gate: if it fails, the app scores 0. Test the critical
-leaves first.
+Critical bar: a requirement or a leaf is critical only if failing it, by itself, badly hurts the user's experience or the user's view of the result. Test: think of an app that does everything else well but fails this one. If the user would call that app broken, wrong, or not what they asked for, it is critical. If the user would only find it weaker, less complete or less polished, it is not critical. A nice-to-have feature is never critical.
+The rubric supplies these flags; do not change them. Assess every leaf on its
+evidence.
 
 Verdicts:
 - PASS: your evidence shows that the app meets the check. The note gives
@@ -82,8 +84,8 @@ Record verdicts with record_verdicts as soon as you have the evidence. Only the
 latest three screenshots stay in context; use read_evidence to revisit older ones.
 You can record several leaves in one call, and a later verdict replaces an
 earlier one. Cite the evidence ids that support each verdict.
-Call finish when every leaf has a verdict. If a critical leaf fails, you can
-call finish at once.
+Call finish to end evaluation immediately when you are done. Record your
+verdicts first. Do not infer a verdict from its score impact.
 
 Browser use: references come from the latest accessibility snapshot, which
 lists interactive elements only. Call get_page_info to read body text. Use
@@ -143,8 +145,8 @@ RECORD_TOOL = _fn(
 )
 FINISH_TOOL = _fn(
     "finish",
-    "End the evaluation. Allowed when every leaf has a verdict, or when a "
-    "critical leaf has FAIL.",
+    "End evaluation immediately and score the recorded verdicts. "
+    "No further model calls or finalization follow finish.",
     {"summary": {"type": "string", "description": "2-3 sentences on the app."}},
     required=["summary"],
 )
@@ -443,12 +445,29 @@ class RubricJudge(ProbeAgent):
         return self.source.search(str(args.get("pattern") or ""))
 
     async def _request(self, client, messages, tools, tool_choice):
+        # Keep the append-only audit history, but send only the latest status table.
+        # Observation, assistant reasoning, and system messages are untouched.
+        table_indices = {
+            i
+            for i, message in enumerate(messages)
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith("Current verdicts (authoritative;")
+        }
+        latest_table = max(table_indices, default=-1)
+        request_messages = [
+            message
+            for i, message in enumerate(messages)
+            if i not in table_indices or i == latest_table
+        ]
         request = {
             "model": self._cfg.model,
-            "messages": messages,
+            "messages": request_messages,
             "tools": tools,
             "tool_choice": tool_choice,
-            "max_tokens": self._cfg.max_output_tokens,
+            "max_tokens": min(self._cfg.max_output_tokens, FINAL_MAX_TOKENS)
+            if getattr(self, "_finalizing", False)
+            else self._cfg.max_output_tokens,
         }
         if not self._no_temperature:
             request["temperature"] = self._cfg.temperature
@@ -562,13 +581,6 @@ class RubricJudge(ProbeAgent):
         )
         return "\n".join(rows)
 
-    def _may_finish(self, leaves: list[dict]) -> bool:
-        return not self._missing(leaves) or any(
-            leaf["critical"]
-            and self.verdicts.get(leaf["id"], {}).get("verdict") == "FAIL"
-            for leaf in leaves
-        )
-
     def _compact(self, messages: list[dict]) -> None:
         """Retain all observation text and only the most recent screenshots."""
         image_count = 0
@@ -626,11 +638,6 @@ class RubricJudge(ProbeAgent):
                 elif final:
                     raise ValueError("only record_verdicts is allowed now")
                 elif name == "finish":
-                    if not self._may_finish(leaves):
-                        missing = self._missing(leaves)
-                        raise ValueError(
-                            f"{len(missing)} leaves have no verdict: {', '.join(missing)}"
-                        )
                     self.summary = str(args.get("summary") or "")
                     finished, reply = True, "Finished."
                 elif name == "read_evidence":
@@ -667,6 +674,8 @@ class RubricJudge(ProbeAgent):
             messages.append(message)
             if observations:
                 self._observations.append(message)
+            if finished:
+                break
         self._compact(messages)
         return finished
 
@@ -680,6 +689,7 @@ class RubricJudge(ProbeAgent):
     ) -> dict[str, Any]:
         started = time.monotonic()
         self._deadline_at = started + self.deadline_s
+        self._finalizing = False
         self._app_url = app_url
         leaves = flatten(rubric["tree"])
         by_id = {leaf["id"]: leaf for leaf in leaves}
@@ -722,8 +732,8 @@ class RubricJudge(ProbeAgent):
             self._observations.append(first)
             finished, step = False, 0
             for step in range(self._cfg.max_steps):
-                if time.monotonic() - started > self.deadline_s:
-                    break
+                if time.monotonic() >= self._deadline_at:
+                    raise TimeoutError("Judge deadline exhausted during exploration")
                 messages.append(
                     {
                         "role": "user",
@@ -735,25 +745,64 @@ class RubricJudge(ProbeAgent):
                 if await self._turn(client, messages, leaves, by_id, step, final=False):
                     finished = True
                     break
-            for _ in range(FINAL_TURNS):
-                missing = self._missing(leaves)
-                if finished or not missing:
+            self._finalizing = True
+            targets = [
+                leaf["id"]
+                for leaf in leaves
+                if not finished
+                and self.verdicts.get(leaf["id"], {}).get("verdict")
+                not in {"PASS", "FAIL"}
+            ]
+            if not finished:
+                self._emit(
+                    {
+                        "kind": "finalization_start",
+                        "targets": targets,
+                        "budget_seconds": max(0, self._deadline_at - time.monotonic()),
+                    }
+                )
+            for final_step in range(FINAL_TURNS):
+                if not targets:
                     break
                 messages.append(
                     {
                         "role": "user",
                         "content": self._verdict_table(leaves, 0)
-                        + "\nThe browser budget has ended. From the evidence that you "
-                        "have, record a verdict for each of these leaves. Use UNKNOWN where "
-                        f"the evidence is not enough: {', '.join(missing)}.",
+                        + "\nExploration has ended. Use only existing evidence. Record a "
+                        "verdict for EVERY listed leaf; revisit earlier UNKNOWN verdicts. "
+                        "Use UNKNOWN when evidence remains insufficient. Keep reasons concise. "
+                        f"Remaining leaves: {', '.join(targets)}.",
                     }
                 )
-                await self._turn(client, messages, leaves, by_id, step, final=True)
+                try:
+                    await self._turn(
+                        client,
+                        messages,
+                        leaves,
+                        by_id,
+                        self._cfg.max_steps + final_step,
+                        final=True,
+                    )
+                except (TimeoutError, APITimeoutError):
+                    if (
+                        time.monotonic() >= self._deadline_at
+                        or final_step + 1 == FINAL_TURNS
+                    ):
+                        raise
+                targets = [
+                    leaf_id
+                    for leaf_id in targets
+                    if self.verdicts.get(leaf_id, {}).get("step", -1)
+                    < self._cfg.max_steps
+                ]
             verdicts = {leaf_id: v["verdict"] for leaf_id, v in self.verdicts.items()}
             result = {
                 **score_tree(leaves, verdicts, min_coverage=min_coverage),
                 "finished_by_model": finished,
             }
+            if result.get("score") is None:
+                result["scoring_status"] = result["status"]
+                result["status"] = "evaluator_failed"
         except Exception as exc:
             result = {
                 "status": "evaluator_failed",

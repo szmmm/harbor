@@ -145,3 +145,24 @@ available through `read_evidence`.
 Task instructions/rubric and harness budget/verdict reminders remain separate
 from tool evidence. Reasoning effort, scoring, and exploration limits are not
 changed by this transport update.
+
+
+### Judge termination and finalization
+
+`finish` ends evaluation immediately, regardless of the recorded verdicts. No
+further tools or model requests execute after it. The scorer then evaluates
+the recorded verdicts; an unusable score fails the evaluation run.
+
+Only exhaustion of the exploration turn limit triggers forced finalization:
+one `record_verdicts` round for pending/UNKNOWN leaves, with one repair round
+for missing or rejected entries. Finalization uses existing evidence only and
+caps each response at 16,384 tokens (or the lower configured output limit).
+UNKNOWN is valid when evidence remains insufficient. Accepted PASS/FAIL leaves
+are not automatically reconsidered. Critical FAIL never forces termination.
+
+Exploration and finalization share the original overall deadline. There is no
+reserved time split and no deadline extension. Request retries remain bounded;
+an exhausted exploration request timeout fails evaluation. If finalization
+cannot complete within the shared deadline, or the scorer cannot produce a
+usable score, the evaluation fails with no reward. Evidence and recorded
+verdicts remain available for diagnosis.
