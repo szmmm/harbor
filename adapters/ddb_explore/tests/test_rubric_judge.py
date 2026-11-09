@@ -89,6 +89,50 @@ def test_flatten_reads_all_branches_in_order():
     assert LEAVES[0]["critical"] and not LEAVES[1]["critical"]
 
 
+def test_transient_judge_failure_retries_same_turn_with_existing_verdicts(
+    tmp_path, monkeypatch
+):
+    import httpx
+    from openai import APITimeoutError
+
+    monkeypatch.setenv("VLM_RETRY_DELAY_S", "0")
+    script = [
+        [("click_ref", {"ref": 0}), ("reload", {})],
+        [
+            (
+                "record_verdicts",
+                {"verdicts": [verdict(i, "PASS", "e0001", "e0002") for i in IDS]},
+            )
+        ],
+        APITimeoutError(
+            request=httpx.Request("POST", "http://judge/v1/chat/completions")
+        ),
+        [("finish", {"summary": "all checked"})],
+    ]
+    result, client = run_judge(tmp_path, script)
+    assert result["status"] == "completed" and result["score"] == 1
+    assert result["model_turns"] == 3 and result["request_retries"] == 1
+    assert client.requests[2] == client.requests[3] or (
+        {k: v for k, v in client.requests[2].items() if k != "timeout"}
+        == {k: v for k, v in client.requests[3].items() if k != "timeout"}
+    )
+    assert len(result["evidence"]) == 3  # no browser restart/action replay
+
+
+
+def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
+    import httpx
+    from openai import APITimeoutError
+
+    monkeypatch.setenv("VLM_RETRY_DELAY_S", "0")
+    monkeypatch.setenv("VLM_REQUEST_RETRIES", "2")
+    error = APITimeoutError(request=httpx.Request("POST", "http://judge"))
+    result, client = run_judge(tmp_path, [error, error, error])
+    assert result["status"] == "evaluator_failed" and result["score"] is None
+    assert len(client.requests) == 3 and result["request_retries"] == 2
+
+
+
 def test_score_is_flat_pass_rate():
     result = score_tree(
         LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"}, min_coverage=1
@@ -321,6 +365,8 @@ class FakeClient:
     def create(self, **request):
         self.requests.append(json.loads(json.dumps(request, default=str)))
         calls = self.script.pop(0) if self.script else []
+        if isinstance(calls, Exception):
+            raise calls
         tool_calls = [
             SimpleNamespace(
                 id=f"c{len(self.requests)}-{n}",

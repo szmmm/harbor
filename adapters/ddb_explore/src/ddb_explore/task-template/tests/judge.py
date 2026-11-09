@@ -17,10 +17,12 @@ import base64
 import datetime
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
+from openai import APIConnectionError, APIStatusError
 from probe import _PROBE_TOOLS, ProbeAgent, _device_block, _fn, _temperature_rejected
 from rubric_score import VERDICTS, flatten, score_tree
 from source_tools import SourceTree
@@ -289,6 +291,7 @@ class RubricJudge(ProbeAgent):
         self.verdicts: dict[str, dict] = {}
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0}
         self.model_turns = 0
+        self.request_retries = 0
         self._observations: list[dict] = []
 
     async def _observe(self, action: str, args: dict, outcome: dict) -> list[dict]:
@@ -441,29 +444,60 @@ class RubricJudge(ProbeAgent):
         if not self._no_temperature:
             request["temperature"] = self._cfg.temperature
         turn = self.model_turns + 1
-        self._emit(
-            {"kind": "judge_request", "turn": turn, "attempt": 1, "request": request}
-        )
-        try:
-            response = await asyncio.to_thread(
-                client.chat.completions.create, **request
-            )
-        except Exception as exc:
-            if not (_temperature_rejected(exc) and "temperature" in request):
-                raise
-            self._no_temperature = True
-            request.pop("temperature")
+        retries = max(0, int(os.environ.get("VLM_REQUEST_RETRIES", "2")))
+        retry_delay = max(0.0, float(os.environ.get("VLM_RETRY_DELAY_S", "5")))
+        deadline = getattr(self, "_deadline_at", time.monotonic() + self.deadline_s)
+        attempt, transient_failures = 0, 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Judge deadline exhausted before model request")
+            # Disable SDK retries in test_explore: one bounded retry loop owns
+            # the budget, retaining this browser, evidence, verdicts and request.
+            request["timeout"] = min(self._cfg.request_timeout_s, remaining)
+            attempt += 1
             self._emit(
                 {
                     "kind": "judge_request",
                     "turn": turn,
-                    "attempt": 2,
+                    "attempt": attempt,
                     "request": request,
                 }
             )
-            response = await asyncio.to_thread(
-                client.chat.completions.create, **request
-            )
+            try:
+                response = await asyncio.to_thread(
+                    client.chat.completions.create, **request
+                )
+                break
+            except Exception as exc:
+                if _temperature_rejected(exc) and "temperature" in request:
+                    self._no_temperature = True
+                    request.pop("temperature")
+                    continue
+                status = getattr(exc, "status_code", None)
+                transient = isinstance(exc, APIConnectionError) or (
+                    isinstance(exc, APIStatusError)
+                    and (exc.status_code in {408, 429} or exc.status_code >= 500)
+                )
+                self._emit(
+                    {
+                        "kind": "judge_request_error",
+                        "turn": turn,
+                        "attempt": attempt,
+                        "error_type": type(exc).__name__,
+                        "status_code": status,
+                        "retryable": transient,
+                    }
+                )
+                if not transient or transient_failures >= retries:
+                    raise
+                transient_failures += 1
+                self.request_retries += 1
+                remaining = deadline - time.monotonic()
+                delay = min(retry_delay * 2 ** (transient_failures - 1), remaining)
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(delay)
         self._emit(
             {
                 "kind": "judge_response",
@@ -629,6 +663,7 @@ class RubricJudge(ProbeAgent):
         min_coverage: float = 0.9,
     ) -> dict[str, Any]:
         started = time.monotonic()
+        self._deadline_at = started + self.deadline_s
         self._app_url = app_url
         leaves = flatten(rubric["tree"])
         by_id = {leaf["id"]: leaf for leaf in leaves}
@@ -736,6 +771,7 @@ class RubricJudge(ProbeAgent):
                 for row in self.evidence
             ],
             model_turns=self.model_turns,
+            request_retries=self.request_retries,
             usage=self.usage,
             elapsed_seconds=time.monotonic() - started,
         )

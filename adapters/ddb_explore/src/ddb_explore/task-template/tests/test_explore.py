@@ -167,8 +167,8 @@ async def run_probe(
         api_key=os.environ.get("VLM_API_KEY", "").strip(),
         base_url=os.environ.get("VLM_API_BASE_URL", "").strip(),
         max_steps=int(os.environ.get("VLM_EXPLORE_MAX_STEPS", "40")),
-        request_timeout_s=float(os.environ.get("VLM_REQUEST_TIMEOUT_S", "120")),
-        max_retries=1,
+        request_timeout_s=float(os.environ.get("VLM_REQUEST_TIMEOUT_S", "600")),
+        max_retries=0,
         temperature=0,
         omit_temperature=_truthy("VLM_OMIT_TEMPERATURE", "1"),
     )
