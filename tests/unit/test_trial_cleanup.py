@@ -2,6 +2,7 @@
 
 import asyncio
 import tempfile
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.environments.capabilities import EnvironmentCapabilities
+from harbor.environments.docker import image_cache
 from harbor.models.agent.context import AgentContext
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.trial.config import (
@@ -325,3 +327,91 @@ class TestPrepareLogsForHostCalledDuringTrial:
 
             assert env.prepare_logs_call_count >= 1
             assert env.stop_call_count == 1
+
+
+@pytest.mark.parametrize("cancellations", [0, 1, 2])
+async def test_image_lease_survives_until_environment_stop_completes(
+    tmp_path, monkeypatch, cancellations
+):
+    trial, agent, env = await _make_trial(tmp_path)
+    events = []
+    original_start = env.start
+    original_stop = env.stop
+
+    async def start(force_build):
+        events.append("environment_start")
+        await original_start(force_build)
+
+    async def stop(delete):
+        await original_stop(delete)
+        events.append("environment_stopped")
+
+    async def quick_run(**kwargs):
+        pass
+
+    class Cache:
+        @asynccontextmanager
+        async def lease_bundle(self, names):
+            assert names == ["test-image"]
+            events.append("lease_acquired")
+            try:
+                yield
+            finally:
+                events.append("lease_released")
+
+    monkeypatch.setattr(env, "start", start)
+    monkeypatch.setattr(env, "stop", stop)
+    monkeypatch.setattr(image_cache, "task_image_names", lambda path: ["test-image"])
+    if not cancellations:
+        monkeypatch.setattr(agent, "run", quick_run)
+
+    token = image_cache.active_image_cache.set(Cache())
+    task = asyncio.create_task(trial.run())
+    try:
+        if cancellations:
+            await asyncio.wait_for(agent.running.wait(), timeout=2)
+            task.cancel()
+        if cancellations == 2:
+            await asyncio.wait_for(env.stop_started.wait(), timeout=2)
+            task.cancel()
+        if cancellations:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+        else:
+            result = await asyncio.wait_for(task, timeout=2)
+            assert result.exception_info is None
+        await asyncio.wait_for(env.stop_completed.wait(), timeout=2)
+    finally:
+        image_cache.active_image_cache.reset(token)
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    assert events == [
+        "lease_acquired",
+        "environment_start",
+        "environment_stopped",
+        "lease_released",
+    ]
+
+
+async def test_end_hook_runs_in_trial_task(tmp_path, monkeypatch):
+    trial, agent, _ = await _make_trial(tmp_path)
+    hook_tasks = []
+
+    async def quick_run(**kwargs):
+        pass
+
+    async def on_end(event):
+        # Job.cancel_trial uses task identity to keep the reporting successful
+        # trial alive when this hook cancels its surplus sibling attempts.
+        hook_tasks.append(asyncio.current_task())
+
+    monkeypatch.setattr(agent, "run", quick_run)
+    trial.add_hook(TrialEvent.END, on_end)
+    task = asyncio.create_task(trial.run())
+    result = await asyncio.wait_for(task, timeout=2)
+
+    assert result.exception_info is None
+    assert hook_tasks == [task]

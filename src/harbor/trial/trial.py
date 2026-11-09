@@ -5,7 +5,7 @@ import hashlib
 import logging
 import traceback
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid4
@@ -68,6 +68,20 @@ from harbor.verifier.factory import VerifierFactory
 TrialHookCallback = Callable[[TrialHookEvent], Awaitable[None]]
 
 _MAX_VERIFIER_ENV_SESSION_ID_LEN = 63
+
+
+async def _finish_cleanup(coro: Coroutine[Any, Any, None]) -> None:
+    """Drain cleanup before propagating cancellation and releasing image leases."""
+    cleanup = asyncio.create_task(coro)
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class Trial(ABC):
@@ -343,29 +357,40 @@ class Trial(ABC):
             await hook(hook_event)
 
     async def run(self) -> TrialResult:
-        self._init_result()
-        await self._emit(TrialEvent.START)
+        from harbor.environments.docker.image_cache import (
+            active_image_cache,
+            task_image_names,
+        )
 
-        try:
-            await self._prepare()
-            if not self.config.install_only:
-                # Setup/install ran in _prepare(); skip the agent run + verification.
-                await self._run()
-        except asyncio.CancelledError as exc:
-            self.logger.debug(f"Trial {self.config.trial_name} cancelled")
-            self._record_exception(exc)
-            await self._emit(TrialEvent.CANCEL)
-            await self._recover_outputs()
-            raise
-        except Exception as exc:
-            self.logger.debug(f"Trial {self.config.trial_name} failed: {exc}")
-            self._record_exception(exc)
-            await self._recover_outputs()
-        finally:
-            await self._finalize()
-            self._close_logger_handler()
+        async with contextlib.AsyncExitStack() as resources:
+            resources.callback(self._close_logger_handler)
+            image_cache = active_image_cache.get()
+            if image_cache is not None:
+                await resources.enter_async_context(
+                    image_cache.lease_bundle(task_image_names(self.task.task_dir))
+                )
+            self._init_result()
+            await self._emit(TrialEvent.START)
 
-        return self.result
+            try:
+                await self._prepare()
+                if not self.config.install_only:
+                    # Setup/install ran in _prepare(); skip the agent run + verification.
+                    await self._run()
+            except asyncio.CancelledError as exc:
+                self.logger.debug(f"Trial {self.config.trial_name} cancelled")
+                self._record_exception(exc)
+                await self._emit(TrialEvent.CANCEL)
+                await self._recover_outputs()
+                raise
+            except Exception as exc:
+                self.logger.debug(f"Trial {self.config.trial_name} failed: {exc}")
+                self._record_exception(exc)
+                await self._recover_outputs()
+            finally:
+                await self._finalize()
+
+            return self.result
 
     @abstractmethod
     async def _run(self) -> None:
@@ -384,11 +409,17 @@ class Trial(ABC):
         self.result.agent_info = self.agent.to_agent_info()
 
     async def _finalize(self) -> None:
-        try:
-            await self.agent.teardown()
-        except Exception as exc:
-            self.logger.warning(f"Agent teardown failed: {exc}")
-        await self._stop_agent_environment()
+        async def cleanup() -> None:
+            try:
+                await self.agent.teardown()
+            except Exception as exc:
+                self.logger.warning(f"Agent teardown failed: {exc}")
+            finally:
+                await self._stop_agent_environment()
+
+        await _finish_cleanup(cleanup())
+        # END hooks must run in the trial task: surplus cancellation relies on
+        # that identity to avoid cancelling the successful reporting trial.
         self.result.finished_at = self._now()
         self.paths.result_path.write_text(
             self.result.model_dump_json(
@@ -590,7 +621,10 @@ class Trial(ABC):
                     logger=self.logger,
                     verifier_env=env,
                     step_name=step_cfg.name if step_cfg is not None else None,
-                    skip_tests_upload=True,
+                    # Keep the runtime verifier authoritative even if a stale or
+                    # externally corrupted Docker build cache supplied the image.
+                    # The upload is small and prevents executing another task's tests.
+                    skip_tests_upload=False,
                 )
 
                 verifier_env_baseline = plan.verifier_env_baseline
@@ -649,7 +683,7 @@ class Trial(ABC):
             yield env
         finally:
             try:
-                await asyncio.shield(env.stop(delete=self.config.environment.delete))
+                await _finish_cleanup(env.stop(delete=self.config.environment.delete))
             except Exception as exc:
                 self.logger.debug(f"Failed to stop verifier env '{key}': {exc}")
 
@@ -1155,7 +1189,7 @@ class Trial(ABC):
             return
 
         try:
-            await asyncio.shield(
+            await _finish_cleanup(
                 self.agent_environment.stop(delete=self.config.environment.delete)
             )
             self._is_agent_environment_stopped = True
@@ -1163,7 +1197,7 @@ class Trial(ABC):
             self._is_agent_environment_stopped = True
             self.logger.debug(
                 f"Cleanup interrupted for {self.config.trial_name}, "
-                "but agent environment stop is shielded and will complete"
+                "after agent environment stop completed"
             )
         except Exception as exc:
             self._is_agent_environment_stopped = True
