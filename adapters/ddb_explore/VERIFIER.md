@@ -166,3 +166,8 @@ an exhausted exploration request timeout fails evaluation. If finalization
 cannot complete within the shared deadline, or the scorer cannot produce a
 usable score, the evaluation fails with no reward. Evidence and recorded
 verdicts remain available for diagnosis.
+
+The verifier requires `APP_BASE_URL`. If the preview fails its readiness check
+(within `APP_READY_TIMEOUT`, default 120 seconds), verification exits with
+`app_unavailable`, disabled scoring, and no local workspace fallback. A missing
+preview URL fails immediately.

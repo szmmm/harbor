@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import asdict
@@ -19,7 +18,7 @@ from urllib.request import Request, urlopen
 
 from browser_env import PlaywrightEnv, resolve_device
 from judge import RubricJudge
-from local_app import LocalAppError, start_local_app, stop_process
+from local_app import start_local_app
 from probe import ProbeConfig
 
 APP_SPEC_PATH = Path("/tests/app_spec.json")
@@ -90,6 +89,7 @@ def _write_report(report: dict[str, Any]) -> None:
 
 
 def start_dev_server():
+    """Retained for future local verification; main currently uses previews only."""
     return start_local_app(
         APP_DIR,
         REPORT_PATH.parent / "local-app.log",
@@ -233,68 +233,48 @@ def main() -> int:
 
     app_spec = json.loads(APP_SPEC_PATH.read_text(encoding="utf-8"))
     rubric = json.loads(RUBRIC_PATH.read_text(encoding="utf-8"))
-    override_url = os.environ.get("APP_BASE_URL", "").strip()
-    process = None
-    report: dict[str, Any]
-    preview_error = None
-    execution_source = "remote_preview" if override_url else "local_workspace"
-    try:
-        app_url = override_url
-        if override_url:
-            preview_error = wait_for_app_ready(override_url, APP_READY_TIMEOUT)
-        if not override_url or preview_error is not None:
-            execution_source = "local_workspace"
-            if preview_error is not None:
-                print(
-                    "Remote preview unavailable; trying downloaded workspace",
-                    flush=True,
-                )
-            try:
-                process, app_url = start_dev_server()
-            except (
-                LocalAppError,
-                OSError,
-                ValueError,
-                subprocess.SubprocessError,
-            ) as exc:
-                report = {
-                    "status": "app_unavailable",
-                    "scoring": "disabled",
-                    "score": None,
-                    "error": re.sub(
-                        r"https?://[^\s<>\"']+",
-                        "<URL redacted>",
-                        f"{type(exc).__name__}: {exc}",
-                    ),
-                    "execution_source": execution_source,
-                    "preview_readiness_error": preview_error,
-                    "findings": [],
-                }
-                _write_report(report)
-                return 1
-        try:
-            report = asyncio.run(run_probe(app_url, app_spec, rubric))
-        except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
-            report = {
-                "status": "evaluator_failed",
+    app_url = os.environ.get("APP_BASE_URL", "").strip()
+    preview_error = (
+        wait_for_app_ready(app_url, APP_READY_TIMEOUT)
+        if app_url
+        else "APP_BASE_URL is not set; a remote preview URL is required"
+    )
+    # Local verification helpers remain available, but routing is disabled for now.
+    if preview_error is not None:
+        _write_report(
+            {
+                "status": "app_unavailable",
                 "scoring": "disabled",
-                "error": re.sub(
-                    r"https?://[^\s<>\"']+",
-                    "<URL redacted>",
-                    f"{type(exc).__name__}: {exc}",
-                ),
+                "score": None,
+                "error": preview_error,
+                "execution_source": "remote_preview",
+                "preview_readiness_error": preview_error,
                 "findings": [],
-                "trace_path": str(TRACE_PATH),
             }
-        report["execution_source"] = execution_source
-        report["preview_readiness_error"] = preview_error
-        _write_report(report)
-        status = str(report.get("status") or "evaluator_failed")
-        print(f"=== Exploratory probe report: {REPORT_PATH} ({status}) ===")
-        return 0 if status == "completed" else 1
-    finally:
-        if process is not None:
-            stop_process(process)
+        )
+        print("=== Preview unavailable; local fallback is disabled ===", flush=True)
+        return 1
+
+    try:
+        report = asyncio.run(run_probe(app_url, app_spec, rubric))
+    except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
+        report = {
+            "status": "evaluator_failed",
+            "scoring": "disabled",
+            "error": re.sub(
+                r"https?://[^\s<>\"']+",
+                "<URL redacted>",
+                f"{type(exc).__name__}: {exc}",
+            ),
+            "findings": [],
+            "trace_path": str(TRACE_PATH),
+        }
+    report["execution_source"] = "remote_preview"
+    report["preview_readiness_error"] = None
+    _write_report(report)
+    status = str(report.get("status") or "evaluator_failed")
+    print(f"=== Exploratory probe report: {REPORT_PATH} ({status}) ===")
+    return 0 if status == "completed" else 1
 
 
 if __name__ == "__main__":
