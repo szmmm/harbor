@@ -819,12 +819,18 @@ class TestStartStaleContainerCleanup:
 
         docker_env._run_docker_compose_command = AsyncMock(side_effect=track_calls)
 
+        async def track_build():
+            calls.append(["build"])
+
+        docker_env._build_main_image = AsyncMock(side_effect=track_build)
+
         with patch(
             "harbor.environments.docker.docker.docker_image_exists",
             new=AsyncMock(return_value=False),
         ):
             await docker_env.start(force_build=True)
 
+        docker_env._build_main_image.assert_awaited_once()
         assert calls[:3] == [
             ["build"],
             ["down", "--remove-orphans"],
@@ -965,8 +971,8 @@ class TestStopChownBindMounts:
 
         docker_env._run_docker_compose_command.assert_called_once_with(["down"])
 
-    async def test_stop_delete_removes_only_local_compose_images(self, docker_env):
-        """delete=True should not remove explicitly tagged shared sidecar images."""
+    async def test_stop_delete_preserves_shared_images(self, docker_env):
+        """delete=True must preserve images shared by concurrent trials."""
         docker_env.prepare_logs_for_host = AsyncMock()
         docker_env._run_docker_compose_command = AsyncMock(
             return_value=ExecResult(return_code=0)
@@ -975,7 +981,7 @@ class TestStopChownBindMounts:
         await docker_env.stop(delete=True)
 
         docker_env._run_docker_compose_command.assert_called_once_with(
-            ["down", "--rmi", "local", "--volumes", "--remove-orphans"]
+            ["down", "--volumes", "--remove-orphans"]
         )
 
 
@@ -2321,3 +2327,26 @@ class TestDockerUploadEnvironmentDirAfterStart:
         await env.start(force_build=False)
 
         env._upload_environment_dir_after_start.assert_awaited_once()
+
+
+async def test_native_no_network_uses_compose_override(docker_env, monkeypatch):
+    monkeypatch.setenv("HARBOR_DOCKER_NATIVE_NO_NETWORK", "1")
+    monkeypatch.delenv("HARBOR_DOCKER_SUBNET_POOL", raising=False)
+    policy = NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+    with patch.object(DockerEnvironment, "_detect_windows_containers", return_value=False):
+        env = DockerEnvironment(
+            environment_dir=docker_env.environment_dir,
+            environment_name="native-test",
+            session_id="native-test",
+            trial_paths=docker_env.trial_paths,
+            task_env_config=EnvironmentConfig(),
+            network_policy=policy,
+        )
+    assert env._native_no_network
+    assert not env._enable_egress_control
+    assert env.capabilities.disable_internet
+    assert env._DOCKER_COMPOSE_NO_NETWORK_PATH.is_file()
+    assert env._DOCKER_COMPOSE_NO_NETWORK_PATH in env._docker_compose_paths
+    await env._apply_network_policy(policy)
+    with pytest.raises(ValueError, match="cannot change network policy"):
+        await env._apply_network_policy(NetworkPolicy(network_mode=NetworkMode.PUBLIC))

@@ -33,6 +33,7 @@ from harbor.environments.definition import (
 from harbor.environments.docker import (
     COMPOSE_BUILD_PATH,
     COMPOSE_EGRESS_CONTROL_PATH,
+    COMPOSE_NO_NETWORK_PATH,
     COMPOSE_PREBUILT_PATH,
     COMPOSE_WINDOWS_KEEPALIVE_PATH,
     EGRESS_CONTROL_SIDECAR_CONTEXT_PATH,
@@ -105,6 +106,7 @@ class DockerEnvironment(BaseEnvironment):
     _DOCKER_COMPOSE_BUILD_PATH = COMPOSE_BUILD_PATH
     _DOCKER_COMPOSE_PREBUILT_PATH = COMPOSE_PREBUILT_PATH
     _DOCKER_COMPOSE_EGRESS_CONTROL_PATH = COMPOSE_EGRESS_CONTROL_PATH
+    _DOCKER_COMPOSE_NO_NETWORK_PATH = COMPOSE_NO_NETWORK_PATH
     _EGRESS_CONTROL_SIDECAR_CONTEXT_PATH = EGRESS_CONTROL_SIDECAR_CONTEXT_PATH
     _EGRESS_CONTROL_SIDECAR_DOCKER_NAME = (
         "harbor-prebuilt:harbor-docker-egress-control-sidecar"
@@ -120,8 +122,22 @@ class DockerEnvironment(BaseEnvironment):
 
     _DOCKER_COMPOSE_WINDOWS_KEEPALIVE_PATH = COMPOSE_WINDOWS_KEEPALIVE_PATH
 
-    # Class-level lock per image name to prevent parallel builds of the same image.
-    _image_build_locks: dict[str, asyncio.Lock] = {}
+    # Docker Compose/BuildKit can cross-wire build contexts when separate compose
+    # projects build different images concurrently against the same daemon. Keep
+    # builds serial while allowing the resulting containers to run concurrently.
+    _compose_build_lock: asyncio.Lock | None = None
+    _compose_build_lock_loop: asyncio.AbstractEventLoop | None = None
+
+    @classmethod
+    def _get_compose_build_lock(cls) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if (
+            DockerEnvironment._compose_build_lock is None
+            or DockerEnvironment._compose_build_lock_loop is not loop
+        ):
+            DockerEnvironment._compose_build_lock = asyncio.Lock()
+            DockerEnvironment._compose_build_lock_loop = loop
+        return DockerEnvironment._compose_build_lock
 
     @staticmethod
     def _detect_daemon_os() -> str | None:
@@ -210,7 +226,8 @@ class DockerEnvironment(BaseEnvironment):
             and not kwargs.get("extra_docker_compose_paths")
         )
         self._enable_egress_control = (
-            not self._is_windows_container
+            not self._native_no_network
+            and not self._is_windows_container
             and self._requires_egress_control(
                 startup_network_policy=startup_network_policy,
                 phase_network_policies=phase_network_policies,
@@ -314,7 +331,7 @@ class DockerEnvironment(BaseEnvironment):
     @override
     def capabilities(self) -> EnvironmentCapabilities:
         return EnvironmentCapabilities(
-            disable_internet=self._enable_egress_control,
+            disable_internet=(self._enable_egress_control or self._native_no_network),
             network_allowlist=self._enable_egress_control,
             network_allowlist_hostnames=self._enable_egress_control,
             network_allowlist_wildcard_hostnames=self._enable_egress_control,
@@ -624,6 +641,49 @@ class DockerEnvironment(BaseEnvironment):
             env_vars["HARBOR_CONTAINER_NAME"] = self._windows_container_name
         return env_vars
 
+    async def _build_main_image(self) -> None:
+        """Build a simple Dockerfile with an explicit, immutable context path.
+
+        Docker Compose interpolation of ``CONTEXT_DIR`` has been observed to
+        cross-wire adjacent concurrent builds. A direct CLI invocation keeps the
+        image tag and resolved context in one argv. Custom compose definitions
+        retain the compose builder because they may declare additional build
+        settings or services.
+        """
+        if (
+            self._environment_docker_compose_path.exists()
+            or self.extra_docker_compose_paths
+        ):
+            await self._run_docker_compose_command(["build", "--no-cache"])
+            return
+
+        context_dir = str(self.environment_dir.resolve().absolute())
+        command = [
+            "docker",
+            "build",
+            "--no-cache",
+            "--tag",
+            self._main_image_name,
+            context_dir,
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        result = await self._collect_buffered_output(
+            process,
+            timeout_sec=None,
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"Docker build failed for environment {self.environment_name}. "
+                f"Command: {' '.join(command)}. "
+                f"Return code: {result.return_code}. "
+                f"Output: {result.stdout}."
+            )
+
     @override
     def _validate_definition(self):
         require_agent_environment_definition(
@@ -907,24 +967,31 @@ class DockerEnvironment(BaseEnvironment):
         # Fail fast if the daemon mode disagrees with the task's declared OS.
         self._validate_daemon_mode()
 
+        from harbor.environments.docker.image_cache import active_image_cache
+
+        image_cache = active_image_cache.get()
+        if image_cache is not None:
+            if force_build or self._use_prebuilt or not self._native_no_network:
+                image_cache.failure = "Archive mode requires Dockerfile images, native no-network, and force_build=False"
+                raise RuntimeError(image_cache.failure)
+            await image_cache.require_image(self._main_image_name)
+
         if self._enable_egress_control:
             await self._ensure_egress_control_sidecar_image_built()
 
-        if not self._use_prebuilt:
+        if not self._use_prebuilt and image_cache is None:
             # The compose service is tagged with _main_image_name. Check before and
-            # after taking the lock so concurrent trials build identical content once.
+            # after taking the daemon-wide build lock so identical content is built
+            # once and different build contexts cannot be cross-wired.
             image_exists = await docker_image_exists(self._main_image_name)
             if force_build or not image_exists:
-                lock = self._image_build_locks.setdefault(
-                    self._main_image_name, asyncio.Lock()
-                )
-                async with lock:
+                async with self._get_compose_build_lock():
                     image_exists = await docker_image_exists(self._main_image_name)
                     if force_build or not image_exists:
-                        await self._run_docker_compose_command(["build"])
+                        await self._build_main_image()
                     else:
                         self.logger.debug(
-                            "Reusing Docker image %s built by another trial",
+                            "Reusing Docker image %s built while waiting for build lock",
                             self._main_image_name,
                         )
             else:
@@ -1034,8 +1101,11 @@ class DockerEnvironment(BaseEnvironment):
                     self.logger.warning(f"Docker compose stop failed: {e}")
             elif delete:
                 try:
+                    # The content-addressed compose image is shared by concurrent
+                    # trials of the same task. Per-trial removal races with peers
+                    # between their image-exists check and `up --no-build`.
                     await self._run_docker_compose_command(
-                        ["down", "--rmi", "local", "--volumes", "--remove-orphans"]
+                        ["down", "--volumes", "--remove-orphans"]
                     )
                 except Exception as e:
                     self.logger.warning(f"Docker compose down failed: {e}")
@@ -1264,6 +1334,13 @@ class DockerEnvironment(BaseEnvironment):
 
     @override
     async def _apply_network_policy(self, network_policy: NetworkPolicy) -> None:
+        if self._native_no_network:
+            if network_policy.network_mode == NetworkMode.NO_NETWORK:
+                return
+            raise ValueError(
+                "Docker native no-network isolation cannot change network policy "
+                "after the environment starts."
+            )
         if not self._enable_egress_control:
             if network_policy.network_mode == NetworkMode.PUBLIC:
                 return
