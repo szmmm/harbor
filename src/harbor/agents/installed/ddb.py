@@ -37,13 +37,13 @@ run harbor run -d webgen-bench/webgen-bench \
     --agent-kwarg proxy_url=http://127.0.0.1:9400
 """
 
-import os
 import asyncio
 import contextlib
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import shutil
 import socket
@@ -54,15 +54,22 @@ import uuid
 from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
-import zstandard
 from typing import Any, override
 from urllib.parse import urlsplit
+
 import httpx
+import zstandard
+
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.utils.logger import logger as global_logger
-from harbor.utils.trajectory_utils import TRAJECTORY_SCORE_TYPES, DEFAULT_TRAJECTORY_SCORE_TYPE, get_trajectory_score, get_source_codes_from_trajectories
+from harbor.utils.trajectory_utils import (
+    DEFAULT_TRAJECTORY_SCORE_TYPE,
+    TRAJECTORY_SCORE_TYPES,
+    get_source_codes_from_trajectories,
+    get_trajectory_score,
+)
 
 # ``GET /tasks/{id}`` vocabulary; the webhook body says "success" where the
 # task record says "completed".
@@ -72,7 +79,13 @@ WEBHOOK_TO_TASK_STATUS = {"success": "completed"}
 # It stays as a forward-compat guard, and stays a deny list on purpose:
 # an unrecognised status counts as terminal, because dropping a real result
 # costs the whole trial while accepting a stray one costs a single wasted fetch.
-NON_TERMINAL_WEBHOOK_STATUSES = {"running", "paused", "waiting_interaction", "pending", "queued"}
+NON_TERMINAL_WEBHOOK_STATUSES = {
+    "running",
+    "paused",
+    "waiting_interaction",
+    "pending",
+    "queued",
+}
 CALLBACK_PATH = "/deepdiver/hook"
 SIGNATURE_HEADER = "x-deepdiver-signature"
 WEBHOOK_SCHEMA_VERSION = "2026-04-23"
@@ -170,7 +183,9 @@ class _WebhookListener:
             if self._server is not None:
                 return
             try:
-                self._server = await asyncio.start_server(self._handle_connection, self._bind_host, self._bind_port)
+                self._server = await asyncio.start_server(
+                    self._handle_connection, self._bind_host, self._bind_port
+                )
             except OSError as exc:
                 raise RuntimeError(
                     f"DDB webhook listener cannot bind {self._bind_host}:{self._bind_port}: {exc}. "
@@ -182,7 +197,9 @@ class _WebhookListener:
                 # directly; anything behind NAT, or a cloud DDB requiring
                 # HTTPS, needs an explicit DDB_CALLBACK_URL front.
                 self._advertised_url = f"http://{_local_ip_towards(self._probe_host)}:{port}{CALLBACK_PATH}"
-            logger.debug(f"DDB webhook listener on {self._bind_host}:{port}, advertised as {self._advertised_url}")
+            logger.debug(
+                f"DDB webhook listener on {self._bind_host}:{port}, advertised as {self._advertised_url}"
+            )
 
     async def stop(self) -> None:
         async with self._start_lock:
@@ -206,8 +223,12 @@ class _WebhookListener:
         not leave its waiter — or a late delivery — behind.
         """
         if task_id in self._waiters:
-            raise RuntimeError(f"A webhook waiter for DDB task {task_id} is already registered")
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            raise RuntimeError(
+                f"A webhook waiter for DDB task {task_id} is already registered"
+            )
+        future: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
         payload = self._pending.pop(task_id, None)
         if payload is not None:
             future.set_result(payload)
@@ -237,9 +258,13 @@ class _WebhookListener:
         # retried delivery just overwrites its predecessor: idempotent.
         self._pending[task_id] = payload
 
-    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
-            status, body = await asyncio.wait_for(self._handle_request(reader), timeout=30)
+            status, body = await asyncio.wait_for(
+                self._handle_request(reader), timeout=30
+            )
         except TimeoutError:
             status, body = 408, b'{"error": "request timeout"}'
         except Exception as exc:
@@ -272,7 +297,10 @@ class _WebhookListener:
             if sep:
                 headers[name.strip().lower()] = value.strip()
         if method == "GET":
-            return 200, b'{"ok": true}' # endpoint-liveness probes some webhook senders make first
+            return (
+                200,
+                b'{"ok": true}',
+            )  # endpoint-liveness probes some webhook senders make first
         if method != "POST":
             return 405, b'{"error": "method not allowed"}'
         if target.split("?", 1)[0].rstrip("/") != CALLBACK_PATH:
@@ -290,9 +318,13 @@ class _WebhookListener:
         body = await reader.readexactly(length)
         # The signature covers the raw body bytes -- verify before parsing.
         received = headers.get(SIGNATURE_HEADER, "").strip()
-        expected = "sha256=" + hmac.new(self.secret.encode(), body, hashlib.sha256).hexdigest()
+        expected = (
+            "sha256=" + hmac.new(self.secret.encode(), body, hashlib.sha256).hexdigest()
+        )
         if not hmac.compare_digest(received, expected):
-            logger.warning("Rejecting DDB webhook delivery with a missing or invalid signature")
+            logger.warning(
+                "Rejecting DDB webhook delivery with a missing or invalid signature"
+            )
             return 401, b'{"error": "bad signature"}'
         try:
             payload = json.loads(body)
@@ -302,7 +334,9 @@ class _WebhookListener:
             return 400, b'{"error": "unexpected payload shape"}'
         version = payload.get("version") or headers.get("x-deepdiver-schema-version")
         if version and version != WEBHOOK_SCHEMA_VERSION:
-            logger.warning(f"DDB webhook schema version {version!r} != expected {WEBHOOK_SCHEMA_VERSION!r}; field names or types may have changed")
+            logger.warning(
+                f"DDB webhook schema version {version!r} != expected {WEBHOOK_SCHEMA_VERSION!r}; field names or types may have changed"
+            )
         logger.debug(
             f"DDB webhook delivery {headers.get('x-deepdiver-delivery-id', '?')}: "
             f"event={payload.get('event')} task={payload.get('task_id')}"
@@ -341,7 +375,9 @@ async def _acquire_listener(
     """
     global _listener, _listener_refs
     if _listener is None:
-        _listener = _WebhookListener(bind_host, bind_port, advertised_url, secret, probe_host)
+        _listener = _WebhookListener(
+            bind_host, bind_port, advertised_url, secret, probe_host
+        )
     elif _listener.config != (bind_host, bind_port, advertised_url, secret):
         raise RuntimeError(
             "All concurrent DDB trials in one process must share the same "
@@ -405,7 +441,9 @@ def _strip_single_root(dest: Path) -> None:
     for entry in list(root.iterdir()):
         shutil.move(str(entry), str(dest / entry.name))
     root.rmdir()
-    logger.debug(f"Stripped the wrapper directory {root.name}/ from the DDB workspace archive")
+    logger.debug(
+        f"Stripped the wrapper directory {root.name}/ from the DDB workspace archive"
+    )
 
 
 def _prune_workspace(dest: Path) -> None:
@@ -474,14 +512,24 @@ class DDB(BaseAgent):
         self.proxy_url = proxy_url
         self.trajectory_score_type = trajectory_score_type.lower()
         if self.trajectory_score_type not in TRAJECTORY_SCORE_TYPES:
-            raise ValueError("Unexpected DDB trajectory_score_type: " + trajectory_score_type)
-        self._base_url = (self._config_value("DDB_BASE_URL", "DEEPDIVER_BASE_URL") or "").rstrip("/")
+            raise ValueError(
+                "Unexpected DDB trajectory_score_type: " + trajectory_score_type
+            )
+        self._base_url = (
+            self._config_value("DDB_BASE_URL", "DEEPDIVER_BASE_URL") or ""
+        ).rstrip("/")
         self._api_key = self._config_value("DDB_API_KEY", "DEEPDIVER_API_KEY") or ""
-        self._preview_base_url = (self._config_value("DDB_PREVIEW_BASE_URL") or self._base_url).rstrip("/")
+        self._preview_base_url = (
+            self._config_value("DDB_PREVIEW_BASE_URL") or self._base_url
+        ).rstrip("/")
         self._callback_url = self._config_value("DDB_CALLBACK_URL")
         self._callback_bind_host = self._config_value("DDB_CALLBACK_HOST") or "0.0.0.0"
-        self._callback_bind_port = int(self._config_value("DDB_CALLBACK_PORT") or DEFAULT_CALLBACK_PORT)
-        self._callback_secret = self._config_value("DDB_CALLBACK_SECRET") or _default_callback_secret()
+        self._callback_bind_port = int(
+            self._config_value("DDB_CALLBACK_PORT") or DEFAULT_CALLBACK_PORT
+        )
+        self._callback_secret = (
+            self._config_value("DDB_CALLBACK_SECRET") or _default_callback_secret()
+        )
         self._app_id_to_delete: str | None = None
 
     def _config_value(self, *keys: str) -> str | None:
@@ -515,7 +563,9 @@ class DDB(BaseAgent):
         if not url:
             return None
         if not url.startswith(self._base_url + "/"):
-            raise RuntimeError(f"Unexpected preview url: {url} for base_url {self._base_url}")
+            raise RuntimeError(
+                f"Unexpected preview url: {url} for base_url {self._base_url}"
+            )
         return f"{self._preview_base_url}/{url[len(self._base_url) + 1 :]}"
 
     @staticmethod
@@ -531,9 +581,13 @@ class DDB(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         # DDB runs on its own cloud; there is nothing to install in the Harbor sandbox. Just fail fast on missing configuration.
         if not self._base_url:
-            raise RuntimeError("DDB base URL is not configured. Set DDB_BASE_URL (or DEEPDIVER_BASE_URL) via --agent-env or the environment.")
+            raise RuntimeError(
+                "DDB base URL is not configured. Set DDB_BASE_URL (or DEEPDIVER_BASE_URL) via --agent-env or the environment."
+            )
         if not self._api_key:
-            raise RuntimeError("DDB API key is not configured. Set DDB_API_KEY (or DEEPDIVER_API_KEY) via --agent-env or the environment.")
+            raise RuntimeError(
+                "DDB API key is not configured. Set DDB_API_KEY (or DEEPDIVER_API_KEY) via --agent-env or the environment."
+            )
 
     async def _get_session(
         self,
@@ -618,11 +672,15 @@ class DDB(BaseAgent):
             self.logger.warning(f"DDB did not delete app {app_id}: {result}")
             return
         if result.get("runtime_cleanup") == "deferred":
-            self.logger.warning(f"DDB deleted app {app_id}, but deferred runtime cleanup to its orchestrator")
+            self.logger.warning(
+                f"DDB deleted app {app_id}, but deferred runtime cleanup to its orchestrator"
+            )
         else:
             self.logger.debug(f"Deleted DDB app {app_id}")
 
-    def _parse_record(self, record: dict[str, Any]) -> tuple[
+    def _parse_record(
+        self, record: dict[str, Any]
+    ) -> tuple[
         dict[str, list[int]],
         dict[str, list[int]],
         dict[str, list[float]],
@@ -649,7 +707,10 @@ class DDB(BaseAgent):
             # Overwritten every turn so the recorded value is the last turn's finish reason (e.g. to detect end-of-rollout truncation).
             finish_reasons[agent_id] = turn["finish_reason"]
             weight_version = turn.get("weight_version")
-            if weight_version is not None and weight_version not in weight_versions[agent_id]:
+            if (
+                weight_version is not None
+                and weight_version not in weight_versions[agent_id]
+            ):
                 weight_versions[agent_id].append(weight_version)
             prompt_token_ids = turn["prompt_token_ids"]
             completion_token_ids = turn["completion_token_ids"]
@@ -678,8 +739,20 @@ class DDB(BaseAgent):
             if len(assistant_turn) > 1:
                 trajectories[agent_id]["messages"].append(assistant_turn)
         for agent_id in trajectories:
-            trajectory_scores[agent_id] = get_trajectory_score(trajectories[agent_id]["messages"], self.trajectory_score_type, reward_cap=1000)["score"]
-        return token_ids, masks, logprobs, trajectories, trajectory_scores, finish_reasons, weight_versions
+            trajectory_scores[agent_id] = get_trajectory_score(
+                trajectories[agent_id]["messages"],
+                self.trajectory_score_type,
+                reward_cap=1000,
+            )["score"]
+        return (
+            token_ids,
+            masks,
+            logprobs,
+            trajectories,
+            trajectory_scores,
+            finish_reasons,
+            weight_versions,
+        )
 
     @override
     async def run(
@@ -723,16 +796,24 @@ class DDB(BaseAgent):
                         "ddb_callback_url": listener.advertised_url,
                         "proxy_session_id": session_id,
                     }
-                    self.logger.debug(f"Submitted DDB task {task_id} (app {app_id}); awaiting webhook at {listener.advertised_url}")
+                    self.logger.debug(
+                        f"Submitted DDB task {task_id} (app {app_id}); awaiting webhook at {listener.advertised_url}"
+                    )
 
                     task = await self.wait_for_webhook(client, listener, task_id)
                     # Preserve the complete diagnostic response before validation.
-                    (self.logs_dir / "task.json").write_text(json.dumps(task, indent=4, ensure_ascii=False))
+                    (self.logs_dir / "task.json").write_text(
+                        json.dumps(task, indent=4, ensure_ascii=False)
+                    )
 
                     result = task.get("result")
-                    success = result.get("success") if isinstance(result, dict) else False
+                    success = (
+                        result.get("success") if isinstance(result, dict) else False
+                    )
                     if not success:
-                        error = result.get("error") if isinstance(result, dict) else ""
+                        failure = await self._capture_failure(task, session_id)
+                        context.metadata["ddb_failure"] = failure
+                        error = failure["error"]
                         status = task.get("status")
                         raise RuntimeError(
                             f"DDB task {task.get('task_id')} did not succeed: "
@@ -750,12 +831,24 @@ class DDB(BaseAgent):
                 if self.training:
                     proxy_url = self.proxy_url
                     if proxy_url is None or session_id is None:
-                        raise RuntimeError("training=True requires proxy_url (the rollout proxy recording token IDs and logprobs).")
+                        raise RuntimeError(
+                            "training=True requires proxy_url (the rollout proxy recording token IDs and logprobs)."
+                        )
                     try:
                         record = await self._get_session(proxy_url, session_id)
                         if record is None:
-                            raise RuntimeError(f"Proxy at {self.proxy_url} has no session {session_id}; no token IDs, masks, and logprobs are recorded for DDB task {task_id}")
-                        token_ids, masks, logprobs, trajectories, trajectory_scores, finish_reasons, weight_versions = self._parse_record(record)
+                            raise RuntimeError(
+                                f"Proxy at {self.proxy_url} has no session {session_id}; no token IDs, masks, and logprobs are recorded for DDB task {task_id}"
+                            )
+                        (
+                            token_ids,
+                            masks,
+                            logprobs,
+                            trajectories,
+                            trajectory_scores,
+                            finish_reasons,
+                            weight_versions,
+                        ) = self._parse_record(record)
                     finally:
                         await self._end_session(proxy_url, session_id)
                     context.metadata["token_ids"] = token_ids
@@ -766,7 +859,7 @@ class DDB(BaseAgent):
                     context.metadata["finish_reasons"] = finish_reasons
                     context.metadata["weight_versions"] = weight_versions
                 else:
-                    trajectories: dict[str, Any] = {} # dummy
+                    trajectories: dict[str, Any] = {}  # dummy
         finally:
             await _release_listener()
 
@@ -793,19 +886,30 @@ class DDB(BaseAgent):
 
         # Auto-inject DDB's preview URL so a URL-based verifier can target the remote app.
         if self._publish_preview_url:
-            preview_url = self._public_preview_url((task.get("result") or {}).get("preview_url"))
+            preview_url = self._public_preview_url(
+                (task.get("result") or {}).get("preview_url")
+            )
             if preview_url:
                 source_codes = get_source_codes_from_trajectories(trajectories)
-                await self.push_data_to_sandbox(environment, app_id, preview_url, source_codes)
+                await self.push_data_to_sandbox(
+                    environment, app_id, preview_url, source_codes
+                )
             else:
-                self.logger.warning(f"DDB task {task_id} produced no preview URL; verifier falls back to local boot")
+                self.logger.warning(
+                    f"DDB task {task_id} produced no preview URL; verifier falls back to local boot"
+                )
 
-        self.logger.debug(f"Finally prepare meta-data for verifier {task_id} (app {app_id})")
+        self.logger.debug(
+            f"Finally prepare meta-data for verifier {task_id} (app {app_id})"
+        )
         self.populate_context(context, task)
 
         build = next(
-            (event.get("data", {}) for event in reversed(task.get("events", []))
-             if event.get("type") == "build_complete"),
+            (
+                event.get("data", {})
+                for event in reversed(task.get("events", []))
+                if event.get("type") == "build_complete"
+            ),
             {},
         )
         if build.get("success") is False:
@@ -820,7 +924,7 @@ class DDB(BaseAgent):
 
     SUBMIT_READ_TIMEOUT_SEC = 300.0
     SUBMIT_ATTEMPTS = 4
-    SUBMIT_RETRY_DELAY_SEC = 5.0 # doubled each retry: 5, 10, 20...
+    SUBMIT_RETRY_DELAY_SEC = 5.0  # doubled each retry: 5, 10, 20...
     RETRYABLE_SUBMIT_STATUSES = frozenset({502, 503, 504})
 
     async def submit_task(
@@ -857,20 +961,29 @@ class DDB(BaseAgent):
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 if attempt + 1 == self.SUBMIT_ATTEMPTS:
                     raise RuntimeError(f"DDB task submission failed: {exc}") from exc
-                self.logger.debug(f"DDB task submission failed ({attempt + 1}/{self.SUBMIT_ATTEMPTS}): {exc}")
+                self.logger.debug(
+                    f"DDB task submission failed ({attempt + 1}/{self.SUBMIT_ATTEMPTS}): {exc}"
+                )
                 continue
-            if response.status_code in self.RETRYABLE_SUBMIT_STATUSES and attempt + 1 < self.SUBMIT_ATTEMPTS:
+            if (
+                response.status_code in self.RETRYABLE_SUBMIT_STATUSES
+                and attempt + 1 < self.SUBMIT_ATTEMPTS
+            ):
                 self.logger.debug(
                     f"DDB task submission failed ({attempt + 1}/{self.SUBMIT_ATTEMPTS}): "
                     f"HTTP {response.status_code}"
                 )
                 continue
             if response.status_code >= 400:
-                raise RuntimeError(f"DDB task submission failed: HTTP {response.status_code}: {response.text}")
+                raise RuntimeError(
+                    f"DDB task submission failed: HTTP {response.status_code}: {response.text}"
+                )
             return response.json()
         raise RuntimeError("DDB task submission failed: retries exhausted")
 
-    async def wait_for_webhook(self, client: httpx.AsyncClient, listener: _WebhookListener, task_id: str) -> dict[str, Any]:
+    async def wait_for_webhook(
+        self, client: httpx.AsyncClient, listener: _WebhookListener, task_id: str
+    ) -> dict[str, Any]:
         """Wait for the terminal webhook, then fetch the task record once.
 
         The webhook payload only carries the final ``result``; the record from
@@ -889,14 +1002,20 @@ class DDB(BaseAgent):
             listener.discard(task_id)
         # The payload is the only artifact that cannot be re-fetched -- keep
         # it even when the record fetch below succeeds.
-        (self.logs_dir / "callback.json").write_text(json.dumps(payload, indent=4, ensure_ascii=False))
+        (self.logs_dir / "callback.json").write_text(
+            json.dumps(payload, indent=4, ensure_ascii=False)
+        )
         task = await self._fetch_task(client, task_id)
         if task is None:
-            self.logger.warning(f"Could not fetch the record of DDB task {task_id}; falling back to the webhook payload")
+            self.logger.warning(
+                f"Could not fetch the record of DDB task {task_id}; falling back to the webhook payload"
+            )
             task = self._task_from_webhook(payload)
         return task
 
-    async def _recover_without_webhook(self, client: httpx.AsyncClient, task_id: str) -> dict[str, Any]:
+    async def _recover_without_webhook(
+        self, client: httpx.AsyncClient, task_id: str
+    ) -> dict[str, Any]:
         """No webhook within ``task_timeout_sec``: lost delivery, or overrun?
 
         One diagnostic fetch: if DDB says the task already finished, the webhook was dropped in
@@ -910,13 +1029,95 @@ class DDB(BaseAgent):
                 f"Check that the callback URL is reachable from the DDB deployment."
             )
             return task
-        self.logger.warning(f"DDB task {task_id} exceeded {self._task_timeout_sec}s; cancelling")
+        self.logger.warning(
+            f"DDB task {task_id} exceeded {self._task_timeout_sec}s; cancelling"
+        )
         await self.cancel_task(client, task_id)
         task = task or {"task_id": task_id}
         task["status"] = "timeout"
         return task
 
-    async def _fetch_task(self, client: httpx.AsyncClient, task_id: str, attempts: int = 3) -> dict[str, Any] | None:
+    async def _capture_failure(
+        self, task: dict[str, Any], session_id: str | None
+    ) -> dict[str, Any]:
+        """Keep the actual DDB error and proxy progress before cleanup."""
+        result = task.get("result") or {}
+        events = []
+        for event in task.get("events") or []:
+            if event.get("type") not in {"error", "complete"}:
+                continue
+            data = event.get("data") or {}
+            events.append(
+                {
+                    "timestamp": event.get("timestamp"),
+                    **{
+                        key: data[key]
+                        for key in (
+                            "iteration",
+                            "error_code",
+                            "retryable",
+                            "error",
+                            "message",
+                            "detail",
+                        )
+                        if key in data
+                    },
+                }
+            )
+        candidates = [task.get("error"), result.get("error")]
+        for event in reversed(events):
+            candidates.extend(event.get(key) for key in ("error", "detail", "message"))
+        failure = {
+            "task_id": task.get("task_id"),
+            "status": task.get("status"),
+            "error": next(
+                (str(value) for value in candidates if value),
+                "No error detail returned by DDB",
+            ),
+            "events": events[-6:],
+        }
+        proxy_url = self.proxy_url
+        if session_id is not None and proxy_url is not None:
+            try:
+                record = await self._get_session(proxy_url, session_id, timeout=10)
+                turns = (record or {}).get("turns") or []
+                failure["proxy_progress"] = {
+                    "session_id": session_id,
+                    "record_found": record is not None,
+                    "completed_turns": len(turns),
+                    "completion_tokens": sum(
+                        len(turn.get("completion_token_ids") or []) for turn in turns
+                    ),
+                    "last_agent_id": turns[-1].get("agent_id") if turns else None,
+                    "last_finish_reason": turns[-1].get("finish_reason")
+                    if turns
+                    else None,
+                }
+            except Exception as exc:
+                self.logger.debug("Could not capture proxy progress", exc_info=True)
+                failure["proxy_diagnostic_error"] = type(exc).__name__
+        # Error details can contain provider URLs/credentials; never persist
+        # those into the concise diagnostic artifact or exception message.
+        encoded = json.dumps(failure, ensure_ascii=False)
+        if self._api_key:
+            encoded = encoded.replace(self._api_key, "[REDACTED]")
+        encoded = re.sub(
+            r"Bearer\s+[^\s\"\\]+", "Bearer [REDACTED]", encoded, flags=re.IGNORECASE
+        )
+        encoded = re.sub(
+            r"([?&](?:token|api_key)=)[^\s\"&\\]+", r"\1[REDACTED]", encoded
+        )
+        failure = json.loads(encoded)
+        failure["error"] = failure["error"][:2000]
+        (self.logs_dir / "failure.json").write_text(
+            json.dumps(failure, ensure_ascii=False, indent=2) + "\n"
+        )
+        return failure
+
+
+    async def _fetch_task(
+        self, client: httpx.AsyncClient, task_id: str, attempts: int = 3
+    ) -> dict[str, Any] | None:
         """Best-effort ``GET /api/v1/tasks/{task_id}`` with a couple of retries.
 
         One flaky request must not discard a build the trial waited on for
@@ -929,7 +1130,9 @@ class DDB(BaseAgent):
                 response.raise_for_status()
                 return response.json()
             except httpx.HTTPError as exc:
-                self.logger.debug(f"Fetching DDB task {task_id} failed ({attempt + 1}/{attempts}): {exc}")
+                self.logger.debug(
+                    f"Fetching DDB task {task_id} failed ({attempt + 1}/{attempts}): {exc}"
+                )
                 if attempt + 1 < attempts:
                     await asyncio.sleep(2 * (attempt + 1))
         return None
@@ -974,10 +1177,14 @@ class DDB(BaseAgent):
                     f"HTTP {response.status_code}: {response.text}"
                 )
             except httpx.HTTPError as exc:
-                self.logger.debug(f"Cancelling DDB task {task_id} failed ({attempt + 1}/{self.CANCEL_ATTEMPTS}): {exc}")
+                self.logger.debug(
+                    f"Cancelling DDB task {task_id} failed ({attempt + 1}/{self.CANCEL_ATTEMPTS}): {exc}"
+                )
             if attempt + 1 < self.CANCEL_ATTEMPTS:
                 await asyncio.sleep(self.CANCEL_RETRY_DELAY_SEC * (attempt + 1))
-        self.logger.warning(f"DDB did not acknowledge cancelling task {task_id}; it may still be running")
+        self.logger.warning(
+            f"DDB did not acknowledge cancelling task {task_id}; it may still be running"
+        )
         return False
 
     async def _abandon(self, task_id: str | None, session_id: str | None) -> None:
@@ -1005,7 +1212,9 @@ class DDB(BaseAgent):
             try:
                 await asyncio.sleep(0.2)
             except asyncio.CancelledError:
-                self.logger.warning(f"Trial teardown interrupted; DDB task {task_id} cleanup continues in the background")
+                self.logger.warning(
+                    f"Trial teardown interrupted; DDB task {task_id} cleanup continues in the background"
+                )
                 return
 
     def _abandon_sync(self, task_id: str | None, session_id: str | None) -> None:
@@ -1038,13 +1247,19 @@ class DDB(BaseAgent):
                                 f"HTTP {response.status_code}: {response.text}"
                             )
                         except httpx.HTTPError as exc:
-                            self.logger.debug(f"Cancelling abandoned DDB task {task_id} failed ({attempt + 1}/{self.CANCEL_ATTEMPTS}): {exc}")
+                            self.logger.debug(
+                                f"Cancelling abandoned DDB task {task_id} failed ({attempt + 1}/{self.CANCEL_ATTEMPTS}): {exc}"
+                            )
                         if attempt + 1 < self.CANCEL_ATTEMPTS:
                             time.sleep(self.CANCEL_RETRY_DELAY_SEC * (attempt + 1))
             except Exception as exc:
-                self.logger.warning(f"Could not cancel abandoned DDB task {task_id}: {exc}")
+                self.logger.warning(
+                    f"Could not cancel abandoned DDB task {task_id}: {exc}"
+                )
             if not cancelled:
-                self.logger.warning(f"DDB did not acknowledge cancelling abandoned task {task_id}; it may still be running")
+                self.logger.warning(
+                    f"DDB did not acknowledge cancelling abandoned task {task_id}; it may still be running"
+                )
 
         # Ending (completing + deleting) the proxy session is the hard
         # cutoff: the proxy refuses every later completion of a deleted
@@ -1062,7 +1277,9 @@ class DDB(BaseAgent):
                         if response.status_code != 404:
                             response.raise_for_status()
             except Exception as exc:
-                self.logger.warning(f"Could not end proxy session {session_id} of abandoned DDB task {task_id}: {exc}")
+                self.logger.warning(
+                    f"Could not end proxy session {session_id} of abandoned DDB task {task_id}: {exc}"
+                )
 
     # ------------------------------------------------------------------
     # Sandbox publishing
@@ -1089,7 +1306,9 @@ class DDB(BaseAgent):
         marker.write_text(preview_url)
         try:
             await environment.upload_file(marker, PREVIEW_URL_SANDBOX_PATH)
-            self.logger.debug(f"Published DDB preview URL to sandbox {PREVIEW_URL_SANDBOX_PATH}")
+            self.logger.debug(
+                f"Published DDB preview URL to sandbox {PREVIEW_URL_SANDBOX_PATH}"
+            )
         except Exception as exc:
             self.logger.warning(f"Failed to publish DDB preview URL to sandbox: {exc}")
         # 2. Upload source code list
@@ -1097,9 +1316,13 @@ class DDB(BaseAgent):
         marker.write_text("\n".join(source_codes))
         try:
             await environment.upload_file(marker, SOURCE_CODES_SANDBOX_PATH)
-            self.logger.debug(f"Published DDB source code list to sandbox {SOURCE_CODES_SANDBOX_PATH}")
+            self.logger.debug(
+                f"Published DDB source code list to sandbox {SOURCE_CODES_SANDBOX_PATH}"
+            )
         except Exception as exc:
-            self.logger.warning(f"Failed to publish DDB source code list to sandbox: {exc}")
+            self.logger.warning(
+                f"Failed to publish DDB source code list to sandbox: {exc}"
+            )
         # 3. Upload workspace
         if not app_id:
             self.logger.warning("DDB reported no app id; the sandbox gets no sources")
@@ -1111,14 +1334,20 @@ class DDB(BaseAgent):
             self.logger.warning(f"Failed to pull workspace for DDB app {app_id}: {exc}")
             return
         if not pulled:
-            self.logger.warning(f"Workspace for DDB app {app_id} yielded no files; the sandbox gets no sources")
+            self.logger.warning(
+                f"Workspace for DDB app {app_id} yielded no files; the sandbox gets no sources"
+            )
             return
         try:
             await environment.ensure_dirs([WORKSPACE_SANDBOX_PATH])
             await environment.upload_dir(local_dir, WORKSPACE_SANDBOX_PATH)
-            self.logger.debug(f"Published workspace for DDB app {app_id} to sandbox {WORKSPACE_SANDBOX_PATH}")
+            self.logger.debug(
+                f"Published workspace for DDB app {app_id} to sandbox {WORKSPACE_SANDBOX_PATH}"
+            )
         except Exception as exc:
-            self.logger.warning(f"Failed to publish workspace for DDB app {app_id} to sandbox: {exc}")
+            self.logger.warning(
+                f"Failed to publish workspace for DDB app {app_id} to sandbox: {exc}"
+            )
 
     # ------------------------------------------------------------------
     # Workspace export
@@ -1159,7 +1388,9 @@ class DDB(BaseAgent):
                 return True
             return await self._pull_workspace_files(client, files_url, local_dir)
 
-    async def _pull_workspace_archive(self, client: httpx.AsyncClient, files_url: str, local_dir: Path) -> bool:
+    async def _pull_workspace_archive(
+        self, client: httpx.AsyncClient, files_url: str, local_dir: Path
+    ) -> bool:
         """Fast path: the ``.tar.zst`` snapshot, unpacked into ``local_dir``."""
         try:
             response = await client.get(f"{files_url}/download")
@@ -1176,7 +1407,9 @@ class DDB(BaseAgent):
         self.logger.debug(f"Pulled the DDB workspace archive to {local_dir}")
         return True
 
-    async def _pull_workspace_files(self, client: httpx.AsyncClient, files_url: str, local_dir: Path) -> bool:
+    async def _pull_workspace_files(
+        self, client: httpx.AsyncClient, files_url: str, local_dir: Path
+    ) -> bool:
         """Fallback: walk the listing and read each file out of DDB.
 
         Unlike the archive, a failure to list is fatal to the pull: there is no third route,
@@ -1191,7 +1424,9 @@ class DDB(BaseAgent):
             },
         )
         if response.status_code >= 400:
-            raise RuntimeError(f"Listing the DDB workspace failed: HTTP {response.status_code}: {response.text}")
+            raise RuntimeError(
+                f"Listing the DDB workspace failed: HTTP {response.status_code}: {response.text}"
+            )
         exclude = re.compile(WORKSPACE_EXCLUDE_PATTERN)
         root = local_dir.resolve()
         targets: list[tuple[str, Path]] = []
@@ -1201,7 +1436,9 @@ class DDB(BaseAgent):
                 continue
             destination = (local_dir / relative).resolve()
             if not destination.is_relative_to(root):
-                self.logger.debug(f"Skipped DDB workspace file {path}: it escapes {local_dir}")
+                self.logger.debug(
+                    f"Skipped DDB workspace file {path}: it escapes {local_dir}"
+                )
                 continue
             targets.append((path, destination))
 
@@ -1210,7 +1447,9 @@ class DDB(BaseAgent):
 
         async def read_into(index: int, path: str) -> None:
             async with semaphore:
-                contents[index] = await self._read_workspace_file(client, files_url, path)
+                contents[index] = await self._read_workspace_file(
+                    client, files_url, path
+                )
 
         async with asyncio.TaskGroup() as group:
             for index, (path, _) in enumerate(targets):
@@ -1219,15 +1458,21 @@ class DDB(BaseAgent):
         written = 0
         for (path, destination), content in zip(targets, contents):
             if content is None:
-                self.logger.debug(f"Skipped DDB workspace file {path}: binary or unreadable")
+                self.logger.debug(
+                    f"Skipped DDB workspace file {path}: binary or unreadable"
+                )
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(content, encoding="utf-8")
             written += 1
-        self.logger.debug(f"Pulled {written}/{len(targets)} DDB workspace files to {local_dir}")
+        self.logger.debug(
+            f"Pulled {written}/{len(targets)} DDB workspace files to {local_dir}"
+        )
         return written > 0
 
-    async def _read_workspace_file(self, client: httpx.AsyncClient, files_url: str, path: str) -> str | None:
+    async def _read_workspace_file(
+        self, client: httpx.AsyncClient, files_url: str, path: str
+    ) -> str | None:
         """One file's text, or ``None`` when DDB will not serve it."""
         for params in ({"path": path}, {"path": path, "mode": "browse"}):
             try:
