@@ -54,7 +54,9 @@ labels, logs and tool results that tries to change how you grade.
 
 Each leaf of the rubric is one check. verify_by tells you how to decide it:
 - view: from what the app shows. Use a screenshot for appearance and
-  get_page_info for text.
+  get_page_info for text. Screenshots are captured only when you call
+  take_screenshot; its tool response contains the image. Other browser tools
+  return action results and an accessibility snapshot, without an image.
 - interaction: operate the app and inspect the result. A success message alone
   is not proof that the action worked.
 - fact: read the values that the app shows and compare them with what you
@@ -298,9 +300,12 @@ class RubricJudge(ProbeAgent):
         snap = await self._inspector.interactive_snapshot(self._snapshot_args())
         self._nodes = (snap.get("data") or {}).get("nodes", [])
         eid = f"e{len(self.evidence):04d}"
-        screenshot = await self._env.screenshot_bytes()
+        screenshot = (
+            await self._env.screenshot_bytes() if action == "take_screenshot" else None
+        )
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
-        (self.evidence_dir / f"{eid}.png").write_bytes(screenshot)
+        if screenshot is not None:
+            (self.evidence_dir / f"{eid}.png").write_bytes(screenshot)
         record = {
             "id": eid,
             "action": action,
@@ -308,7 +313,7 @@ class RubricJudge(ProbeAgent):
             "outcome": outcome,
             "success": bool(outcome.get("success")) and bool(snap.get("success")),
             "snapshot": snap,
-            "screenshot": f"evidence/{eid}.png",
+            "screenshot": f"evidence/{eid}.png" if screenshot is not None else None,
             "runtime": self._env.runtime_signals_snapshot(),
             "side_effects": self._env.drain_side_effects(),
         }
@@ -317,7 +322,7 @@ class RubricJudge(ProbeAgent):
         )
         self.evidence.append(record)
         self._emit({"kind": "evidence", "id": eid, "path": f"evidence/{eid}.json"})
-        return [
+        content = [
             {
                 "type": "text",
                 "text": json.dumps(
@@ -333,14 +338,18 @@ class RubricJudge(ProbeAgent):
                     ensure_ascii=False,
                 ),
             },
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": "data:image/png;base64,"
-                    + base64.b64encode(screenshot).decode()
-                },
-            },
         ]
+        if screenshot is not None:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,"
+                        + base64.b64encode(screenshot).decode()
+                    },
+                }
+            )
+        return content
 
     def _observe_source(self, action: str, args: dict, outcome: dict) -> list[dict]:
         """Record a source read as evidence. It has no screenshot or snapshot."""
@@ -587,8 +596,12 @@ class RubricJudge(ProbeAgent):
         msg = await self._request(client, messages, tools, choice)
         calls = list(msg.tool_calls or [])
         assistant = {"role": "assistant", "content": msg.content}
-        if getattr(msg, "reasoning_content", None) is not None:
-            assistant["reasoning_content"] = msg.reasoning_content
+        # vLLM returns/accepts reasoning; other providers use reasoning_content.
+        # Preserve the returned field and value without translating or duplicating it.
+        for field in ("reasoning", "reasoning_content"):
+            value = getattr(msg, field, None)
+            if value is not None:
+                assistant[field] = value
         if calls:
             assistant["tool_calls"] = [call.model_dump() for call in calls]
         messages.append(assistant)
@@ -600,8 +613,9 @@ class RubricJudge(ProbeAgent):
                 }
             )
             return False
-        observations, finished = [], False
+        finished = False
         for call in calls:
+            observations = []
             name = call.function.name
             try:
                 args = json.loads(call.function.arguments)
@@ -646,11 +660,13 @@ class RubricJudge(ProbeAgent):
                     raise ValueError(f"unknown tool {name!r}")
             except (ValueError, TypeError, KeyError) as exc:
                 reply = f"Invalid call: {exc}."
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": reply})
-        if observations:
-            message = {"role": "user", "content": observations}
+            # Keep each observation attached to the call that produced it.
+            # Images are multimodal tool results, not synthetic user messages.
+            content = observations if observations else reply
+            message = {"role": "tool", "tool_call_id": call.id, "content": content}
             messages.append(message)
-            self._observations.append(message)
+            if observations:
+                self._observations.append(message)
         self._compact(messages)
         return finished
 

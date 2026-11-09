@@ -106,7 +106,9 @@ entry point with that flag also exits without reading or scoring a trajectory.
 - The judge is one sample at temperature 0 (or the server default when
   `VLM_OMIT_TEMPERATURE=1`). Verdict noise is not measured yet.
 
-The judge preserves returned `reasoning_content` in subsequent requests. It can
+The judge preserves returned `reasoning` and/or `reasoning_content` fields
+verbatim under their original names in subsequent requests. The deployed vLLM
+endpoint consumes `reasoning`; its tokenizer ignores `reasoning_content`. It can
 use `read_evidence(evidence_id)` to retrieve saved text and screenshots without
 changing the browser, and `return_to_app()` to reopen the original preview URL.
 Retrieved screenshots join the same three-image context window.
@@ -119,3 +121,24 @@ localStorage and IndexedDB but start empty sessionStorage. A fresh context may
 represent a different anonymous user; clearing storage is not a persistence test.
 Each turn receives a current table of all leaf verdicts and their evidence IDs,
 including PENDING and UNKNOWN. The latest table supersedes earlier tables.
+
+
+### Judge observation transport
+
+Only an explicit `take_screenshot()` captures a screenshot. Opening the app,
+clicking, scrolling, waiting, reloading, and reading page text do not capture
+images. Browser actions still return fresh accessibility snapshots, action
+outcomes, runtime signals, side effects, and evidence IDs. The initial app-open
+snapshot is bootstrap task context; subsequent observations are tool results.
+
+Each tool result is attached to its originating `tool_call_id`, including source
+file listings/reads/searches and historical evidence retrieval. Screenshots are
+image content blocks in the `take_screenshot` tool response, alongside text
+metadata. No separate user-role message is added for these tool observations.
+Historical evidence only includes an image if one was originally captured.
+The latest three attached images remain in model context; older images remain
+available through `read_evidence`.
+
+Task instructions/rubric and harness budget/verdict reminders remain separate
+from tool evidence. Reasoning effort, scoring, and exploration limits are not
+changed by this transport update.

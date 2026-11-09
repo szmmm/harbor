@@ -119,7 +119,6 @@ def test_transient_judge_failure_retries_same_turn_with_existing_verdicts(
     assert len(result["evidence"]) == 3  # no browser restart/action replay
 
 
-
 def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
     import httpx
     from openai import APITimeoutError
@@ -130,7 +129,6 @@ def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
     result, client = run_judge(tmp_path, [error, error, error])
     assert result["status"] == "evaluator_failed" and result["score"] is None
     assert len(client.requests) == 3 and result["request_retries"] == 2
-
 
 
 def test_score_is_flat_pass_rate():
@@ -397,6 +395,35 @@ class FakeClient:
         pass
 
 
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
+def test_provider_reasoning_field_round_trip(tmp_path, monkeypatch, field):
+    from openai.types.chat import ChatCompletionMessage
+
+    original = FakeClient.create
+
+    def create(self, **request):
+        result = original(self, **request)
+        msg = result.choices[0].message
+        result.choices[0].message = ChatCompletionMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": None,
+                field: "Exact thought.\nDo not alter.",
+                "tool_calls": [call.model_dump() for call in msg.tool_calls],
+            }
+        )
+        return result
+
+    monkeypatch.setattr(FakeClient, "create", create)
+    _, client = run_judge(tmp_path, [[("get_page_info", {})]], max_steps=1)
+    assistant = next(
+        m for m in client.requests[1]["messages"] if m["role"] == "assistant"
+    )
+    assert assistant[field] == "Exact thought.\nDo not alter."
+    other = "reasoning_content" if field == "reasoning" else "reasoning"
+    assert other not in assistant
+
+
 def verdict(leaf_id, value, *evidence):
     return {
         "leaf_id": leaf_id,
@@ -503,7 +530,8 @@ def test_judge_loop_scores_recorded_verdicts(tmp_path):
         "PASS",
         "PASS",
     ]
-    assert len(result["evidence"]) == 4 and (tmp_path / "evidence/e0003.png").is_file()
+    assert len(result["evidence"]) == 4
+    assert not list((tmp_path / "evidence").glob("*.png"))
     # The early finish was refused with the leaves that still need a verdict.
     refused = [m for m in client.requests[3]["messages"] if m["role"] == "tool"][-1]
     assert "D.C.1" in refused["content"]
@@ -541,16 +569,17 @@ def test_judge_without_verdicts_has_no_score(tmp_path):
 
 
 def test_old_observations_keep_text_and_limit_images(tmp_path):
-    script = [[("click_ref", {"ref": 0})] for _ in range(7)]
+    script = [[("take_screenshot", {})] for _ in range(7)]
     result, client = run_judge(tmp_path, script, max_steps=7)
     texts = [
         json.loads(item["text"])
         for m in client.requests[-1]["messages"]
-        if m["role"] == "user" and isinstance(m["content"], list)
+        if isinstance(m["content"], list)
         for item in m["content"]
         if item["type"] == "text" and item["text"].startswith("{")
     ]
-    # The open page and 7 clicks retain all snapshot text.
+    # The open page and 7 explicit screenshots retain all snapshot text.
+    assert len(texts) == 8
     assert all("snapshot" in t for t in texts)
     images = [
         item
@@ -638,8 +667,9 @@ def test_adapter_writes_rubric_tasks(tmp_path):
 
 
 def test_reasoning_and_retrieved_evidence_reach_next_request(tmp_path):
-    script = [[("click_ref", {"ref": 0})] for _ in range(4)]
-    script += [[("read_evidence", {"evidence_id": "e0000"})]]
+    script = [[("take_screenshot", {})]]
+    script += [[("click_ref", {"ref": 0})] for _ in range(3)]
+    script += [[("read_evidence", {"evidence_id": "e0001"})]]
     result, client = run_judge(tmp_path, script, max_steps=5)
     messages = client.requests[-1]["messages"]
     assistants = [m for m in messages if m["role"] == "assistant"]
@@ -654,7 +684,8 @@ def test_reasoning_and_retrieved_evidence_reach_next_request(tmp_path):
         )
     ]
     assert len(historical) == 1
-    assert json.loads(historical[0]["content"][0]["text"])["evidence_id"] == "e0000"
+    assert historical[0]["role"] == "tool"
+    assert json.loads(historical[0]["content"][0]["text"])["evidence_id"] == "e0001"
     assert historical[0]["content"][1]["type"] == "image_url"
     assert len(result["evidence"]) == 5  # Retrieval creates no new evidence/action.
 
