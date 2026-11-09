@@ -135,9 +135,10 @@ async def run_probe(
         base_url=os.environ.get("VLM_API_BASE_URL", "").strip(),
         max_steps=int(os.environ.get("VLM_EXPLORE_MAX_STEPS", "40")),
         request_timeout_s=float(os.environ.get("VLM_REQUEST_TIMEOUT_S", "600")),
+        # RubricJudge owns retries and the shared deadline; disable SDK retries.
         max_retries=0,
-        temperature=0,
-        omit_temperature=_truthy("VLM_OMIT_TEMPERATURE", "1"),
+        temperature=float(os.environ.get("VLM_TEMPERATURE", "1.0")),
+        omit_temperature=_truthy("VLM_OMIT_TEMPERATURE", "0"),
     )
     deadline_s = float(os.environ.get("VLM_EXPLORE_DEADLINE_S", "1500"))
     min_coverage = float(os.environ.get("VLM_RUBRIC_MIN_COVERAGE", "0.9"))

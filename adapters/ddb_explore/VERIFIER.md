@@ -103,8 +103,11 @@ entry point with that flag also exits without reading or scoring a trajectory.
 - Single-app scoring only. Each trial is judged alone; there is no pairwise or
   per-leaf A/B comparison inside a GRPO group yet.
 - `fact` leaves rely on the judge model's own knowledge. It has no web search.
-- The judge is one sample at temperature 0 (or the server default when
-  `VLM_OMIT_TEMPERATURE=1`). Verdict noise is not measured yet.
+- The judge uses temperature 1.0 by default (`VLM_TEMPERATURE`), matching the
+  temperature used in GLM-5.3-Flash's published multimodal and tool-use evaluations
+  ([model card](https://huggingface.co/zai-org/GLM-5.3-Flash#footnotes)).
+  `VLM_OMIT_TEMPERATURE=1` instead uses the server default. Each trial uses one
+  judge run; verdict noise is not measured yet.
 
 The judge preserves returned `reasoning` and/or `reasoning_content` fields
 verbatim under their original names in subsequent requests. The deployed vLLM
