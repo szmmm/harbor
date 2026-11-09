@@ -698,6 +698,10 @@ class DDB(BaseAgent):
         weight_versions = {}
         for turn in record["turns"]:
             agent_id = turn["agent_id"]
+            # Auxiliary summaries quote historical assistant text as input;
+            # they are not task-policy trajectories and must never train.
+            if agent_id.startswith("compaction"):
+                continue
             if agent_id not in token_ids:
                 token_ids[agent_id] = []
                 masks[agent_id] = []

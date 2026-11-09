@@ -46,3 +46,13 @@ def test_failure_extracts_event_error_and_captures_proxy_progress(tmp_path):
     saved = (tmp_path / "failure.json").read_text()
     assert "private-key" not in saved and "Provider failed" in failure["error"]
     assert json.loads(saved)["events"][0]["retryable"] is True
+
+
+def test_compaction_tokens_are_excluded_from_training():
+    agent = object.__new__(DDB)
+    # No policy fields are needed: an auxiliary stream must be skipped before
+    # token extraction or trajectory scoring, even if it is the only record.
+    assert all(
+        not value
+        for value in agent._parse_record({"turns": [{"agent_id": "compaction123"}]})
+    )
