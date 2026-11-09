@@ -68,9 +68,11 @@ Verdicts:
 - FAIL: your evidence shows that the app does not meet the check. This
   includes a feature that is missing or does not work. Before you decide that a
   control is missing, look on the relevant page with a large enough snapshot.
-- UNTESTED: you could not test the check. For example, the budget ended, no tool
-  could reach the control, or the check needs knowledge that you do not have.
-  Never use UNTESTED for a feature that you looked for and did not find, or
+- UNKNOWN: available evidence is insufficient to determine whether the app
+  meets the check, including when testing was attempted but inconclusive.
+  For example, the budget ended, no tool could reach the control, or the check
+  needs knowledge that you do not have.
+  Never use UNKNOWN for a feature that you looked for and did not find, or
   that you tried and that did not work.
 Record verdicts with record_verdicts as soon as you have the evidence. Only the
 latest three screenshots stay in context; use read_evidence to revisit older ones.
@@ -245,7 +247,7 @@ def check_verdict(
     unknown = [ref for ref in refs if ref not in evidence]
     if unknown:
         raise ValueError(f"unknown evidence {unknown}")
-    if verdict != "UNTESTED":
+    if verdict != "UNKNOWN":
         records = [evidence[ref] for ref in refs]
         if not records:
             raise ValueError(f"{verdict} needs at least one evidence id")
@@ -513,7 +515,7 @@ class RubricJudge(ProbeAgent):
                 f"{', '.join(verdict.get('evidence_ids', [])) or '-'}"
             )
         rows.append(
-            "PENDING has no recorded verdict. Revisit UNTESTED if evidence becomes available."
+            "PENDING has no recorded verdict. Revisit UNKNOWN if evidence becomes available."
         )
         return "\n".join(rows)
 
@@ -691,7 +693,7 @@ class RubricJudge(ProbeAgent):
                         "role": "user",
                         "content": self._verdict_table(leaves, 0)
                         + "\nThe browser budget has ended. From the evidence that you "
-                        "have, record a verdict for each of these leaves. Use UNTESTED where "
+                        "have, record a verdict for each of these leaves. Use UNKNOWN where "
                         f"the evidence is not enough: {', '.join(missing)}.",
                     }
                 )
@@ -724,7 +726,7 @@ class RubricJudge(ProbeAgent):
                     "description": leaf["description"],
                     **self.verdicts.get(
                         leaf["id"],
-                        {"verdict": "UNTESTED", "reason": "", "evidence_ids": []},
+                        {"verdict": "UNKNOWN", "reason": "", "evidence_ids": []},
                     ),
                 }
                 for leaf in leaves

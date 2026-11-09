@@ -108,8 +108,8 @@ def test_failed_critical_leaf_gates_to_zero_even_with_gaps():
     )
 
 
-def test_untested_critical_leaf_has_no_score():
-    verdicts = {i: "PASS" for i in IDS} | {"I.1": "UNTESTED"}
+def test_unknown_critical_leaf_has_no_score():
+    verdicts = {i: "PASS" for i in IDS} | {"I.1": "UNKNOWN"}
     result = score_tree(LEAVES, verdicts, min_coverage=0)
     assert result["status"] == "incomplete" and result["score"] is None
 
@@ -119,7 +119,7 @@ def test_low_coverage_has_no_score_and_enough_coverage_scores_resolved_leaves():
     assert score_tree(LEAVES, verdicts, min_coverage=0.9)["score"] is None
     result = score_tree(LEAVES, verdicts, min_coverage=0.8)
     assert result["score"] == pytest.approx(3 / 4)
-    assert result["counts"] == {"PASS": 3, "FAIL": 1, "UNTESTED": 1}
+    assert result["counts"] == {"PASS": 3, "FAIL": 1, "UNKNOWN": 1}
 
 
 @pytest.mark.skipif(
@@ -217,7 +217,7 @@ def test_check_verdict_accepts():
         EVIDENCE,
     )
     assert ok["verdict"] == "PASS"
-    # A missing feature can fail from the landing page; UNTESTED needs no evidence.
+    # A missing feature can fail from the landing page; UNKNOWN needs no evidence.
     check_verdict(
         {
             "leaf_id": "I.1",
@@ -231,7 +231,7 @@ def test_check_verdict_accepts():
     check_verdict(
         {
             "leaf_id": "D.C.1",
-            "verdict": "UNTESTED",
+            "verdict": "UNKNOWN",
             "reason": "budget",
             "evidence_ids": [],
         },
@@ -415,7 +415,7 @@ def test_page_and_source_tools_record_evidence(tmp_path):
     ]
     assert result["evidence"][3]["screenshot"] is None
     # D.B.1 is an interaction leaf: a PASS citing only the landing page is rejected.
-    assert result["leaves"][3]["verdict"] == "UNTESTED"
+    assert result["leaves"][3]["verdict"] == "UNKNOWN"
     assert result["status"] == "incomplete" and result["coverage"] == pytest.approx(
         4 / 5
     )
@@ -474,7 +474,7 @@ def test_judge_forces_verdicts_when_budget_ends(tmp_path):
                 "record_verdicts",
                 {
                     "verdicts": [verdict(i, "PASS", "e0001") for i in IDS[:4]]
-                    + [verdict("D.C.1", "UNTESTED")]
+                    + [verdict("D.C.1", "UNKNOWN")]
                 },
             )
         ],

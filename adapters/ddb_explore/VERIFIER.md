@@ -36,7 +36,7 @@ The judge has more tools for leaves that the screen alone cannot decide:
   source or a new session.
 
 The judge records verdicts with `record_verdicts` while it works: PASS, FAIL or
-UNTESTED, a reason, and the evidence IDs that support it. A later verdict for a
+UNKNOWN, a reason, and the evidence IDs that support it. A later verdict for a
 leaf replaces the earlier one. Code rejects a verdict that cites an unknown or
 failed observation, a PASS or FAIL with no evidence, and a PASS on an
 `interaction` leaf without an observation after an action. The model must
@@ -57,7 +57,7 @@ to two more turns to record verdicts for the remaining leaves.
 rate. A failed critical leaf sets the score to 0. Else the score is the pass
 rate, and every leaf has the same weight. Branches only group leaves.
 
-UNTESTED leaves have no verdict. A critical leaf without a verdict makes the
+UNKNOWN leaves have no verdict. A critical leaf without a verdict makes the
 score unavailable. So does coverage (leaves with PASS or FAIL, divided by all
 leaves) below `VLM_RUBRIC_MIN_COVERAGE` (0.9 by default). Else the pass rate is
 over the leaves with a verdict. With `VLM_RUBRIC_MIN_COVERAGE=1` the score is
@@ -118,4 +118,4 @@ context with an isolated profile (`fresh_context`). The first two retain cookies
 localStorage and IndexedDB but start empty sessionStorage. A fresh context may
 represent a different anonymous user; clearing storage is not a persistence test.
 Each turn receives a current table of all leaf verdicts and their evidence IDs,
-including PENDING and UNTESTED. The latest table supersedes earlier tables.
+including PENDING and UNKNOWN. The latest table supersedes earlier tables.

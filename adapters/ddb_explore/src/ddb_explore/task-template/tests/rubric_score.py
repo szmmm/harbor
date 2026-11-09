@@ -4,7 +4,7 @@ Gate, then flat rate, as in the generator's reference scorer (rubric_tree/score.
 a failed critical leaf sets the score to 0; else the score is the pass rate,
 and every leaf has the same weight. Branches only group leaves.
 
-The judge can leave a leaf UNTESTED when it could not reach the check. Such a
+The judge can leave a leaf UNKNOWN when it could not reach the check. Such a
 leaf has no verdict. A critical leaf without a verdict, or coverage below
 ``min_coverage``, makes the score unavailable: a missing measurement must not
 become a training reward. Else the pass rate is over the leaves with a verdict.
@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 BRANCHES = ("intention", "content", "static", "dynamic")
-VERDICTS = ("PASS", "FAIL", "UNTESTED")
+VERDICTS = ("PASS", "FAIL", "UNKNOWN")
 
 
 def flatten(tree: dict[str, Any]) -> list[dict[str, Any]]:
@@ -58,7 +58,7 @@ def score_tree(
     *,
     min_coverage: float,
 ) -> dict[str, Any]:
-    """``verdicts`` maps leaf id to PASS, FAIL or UNTESTED; absent means UNTESTED."""
+    """``verdicts`` maps leaf id to PASS, FAIL or UNKNOWN; absent means UNKNOWN."""
     resolved = {
         leaf["id"]: verdicts[leaf["id"]] == "PASS"
         for leaf in leaves
@@ -76,7 +76,11 @@ def score_tree(
     n_pass = sum(resolved.values())
     branches = {}
     for branch in BRANCHES:
-        results = [resolved[l["id"]] for l in leaves if l["branch"] == branch and l["id"] in resolved]
+        results = [
+            resolved[l["id"]]
+            for l in leaves
+            if l["branch"] == branch and l["id"] in resolved
+        ]
         branches[branch] = sum(results) / len(results) if results else None
     result = {
         "coverage": coverage,
@@ -85,16 +89,26 @@ def score_tree(
         "failed_critical": failed_critical,
         "unresolved_critical": unresolved_critical,
         "counts": {
-            verdict: sum(1 for l in leaves if verdicts.get(l["id"], "UNTESTED") == verdict)
+            verdict: sum(
+                1 for l in leaves if verdicts.get(l["id"], "UNKNOWN") == verdict
+            )
             for verdict in VERDICTS
         },
     }
     if failed_critical:
         return {**result, "status": "completed", "score": 0.0}
     if unresolved_critical:
-        return {**result, "status": "incomplete", "score": None,
-                "error": f"Critical leaves without a verdict: {unresolved_critical}"}
+        return {
+            **result,
+            "status": "incomplete",
+            "score": None,
+            "error": f"Critical leaves without a verdict: {unresolved_critical}",
+        }
     if coverage < min_coverage:
-        return {**result, "status": "incomplete", "score": None,
-                "error": f"Coverage {coverage:.2f} is below {min_coverage:.2f}"}
+        return {
+            **result,
+            "status": "incomplete",
+            "score": None,
+            "error": f"Coverage {coverage:.2f} is below {min_coverage:.2f}",
+        }
     return {**result, "status": "completed", "score": result["pass_rate"]}
