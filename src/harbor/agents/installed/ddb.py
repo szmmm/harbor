@@ -668,7 +668,7 @@ class DDB(BaseAgent):
         leg judges the app through its preview URL, which the deletion tears
         down. Deleting inside ``run()`` left the verifier judging a dead URL.
         """
-        await self._delete_ddb_app(self._app_id_to_delete)
+        # await self._delete_ddb_app(self._app_id_to_delete)
         self._app_id_to_delete = None
 
     async def _delete_ddb_app(self, app_id: str | None) -> None:

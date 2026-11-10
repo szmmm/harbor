@@ -7,6 +7,7 @@ the rollout function does with the trials it gets back.
 from __future__ import annotations
 
 import asyncio
+import json
 from argparse import Namespace
 from typing import Any
 
@@ -22,8 +23,8 @@ from harbor.slime_bridge.convert import (
 )
 from harbor.slime_bridge.rollout import (
     _dedupe_by_task,
-    _target_trials,
     _return_to_data_source,
+    _target_trials,
     _train,
 )
 from harbor.slime_bridge.trial import TrialRollout
@@ -47,6 +48,9 @@ def make_args(**overrides) -> Namespace:
         harbor_max_sample_len=None,
         rollout_max_context_len=None,
         harbor_service_url="http://harbor-svc:9500",
+        harbor_service_urls=None,
+        harbor_task_route_file=None,
+        harbor_service_deadline_secs=86400.0,
         global_batch_size=1,
         custom_rm_path="harbor.slime_bridge.reward.harbor_verifier_reward",
     )
@@ -203,6 +207,227 @@ class TestServiceUrlRequired:
     # test_layering.py, alongside the slime-free guard for the service chain.
 
 
+class TestMultipleHarborServices:
+    def test_route_manifest_pins_tasks_to_runner_service_urls(self, tmp_path):
+        route_file = tmp_path / "routes.json"
+        route_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "runners": {
+                        "h20": {"service_url": "http://h20:9500"},
+                        "h20-2": {"service_url": "http://h20-2:9500"},
+                    },
+                    "tasks": {
+                        "task-a": {"runner": "h20-2", "image": "image-a"},
+                        "task-b": {"runner": "h20", "image": "image-b"},
+                    },
+                }
+            )
+        )
+        args = make_args(
+            harbor_service_url=None,
+            harbor_service_urls=["http://h20:9500", "http://h20-2:9500"],
+            harbor_task_route_file=str(route_file),
+        )
+
+        assert rollout_mod._task_routes_for_ids(args, ["task-a", "task-b"]) == {
+            "task-a": "http://h20-2:9500",
+            "task-b": "http://h20:9500",
+        }
+
+    def test_route_manifest_rejects_missing_requested_task(self, tmp_path):
+        route_file = tmp_path / "routes.json"
+        route_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "runners": {"h20": {"service_url": "http://h20:9500"}},
+                    "tasks": {},
+                }
+            )
+        )
+        args = make_args(harbor_task_route_file=str(route_file))
+
+        with pytest.raises(RuntimeError, match="missing requested task.*task-a"):
+            rollout_mod._task_routes_for_ids(args, ["task-a"])
+
+    def test_route_manifest_rejects_unconfigured_runner_service(self, tmp_path):
+        route_file = tmp_path / "routes.json"
+        route_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "runners": {"h20-2": {"service_url": "http://h20-2:9500"}},
+                    "tasks": {"task-a": {"runner": "h20-2", "image": "image-a"}},
+                }
+            )
+        )
+        args = make_args(harbor_task_route_file=str(route_file))
+
+        with pytest.raises(RuntimeError, match="unconfigured service"):
+            rollout_mod._task_routes_for_ids(args, ["task-a"])
+
+    def test_partitions_round_robin_and_calls_services_concurrently(self, monkeypatch):
+        args = make_args(
+            harbor_service_url=None,
+            harbor_service_urls=["http://h20:9500", "http://h20-2:9500"],
+        )
+        active = 0
+        max_active = 0
+        calls: list[tuple[str, list[str]]] = []
+
+        async def fake_run_harbor(
+            service_args, _label, task_ids, _n_trials, n_targets=None
+        ):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append((service_args.harbor_service_url, list(task_ids)))
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {task_id: [] for task_id in task_ids}
+
+        monkeypatch.setattr(rollout_mod, "_run_harbor", fake_run_harbor)
+
+        result = asyncio.run(
+            rollout_mod._run_harbor_distributed(
+                args,
+                "rollout_0",
+                ["task-a", "task-b", "task-c", "task-d"],
+                2,
+            )
+        )
+
+        assert sorted(calls) == [
+            ("http://h20-2:9500", ["task-b", "task-d"]),
+            ("http://h20:9500", ["task-a", "task-c"]),
+        ]
+        assert max_active == 2
+        assert list(result) == ["task-a", "task-b", "task-c", "task-d"]
+
+    def test_refill_keeps_each_group_on_its_original_service(self, monkeypatch):
+        args = make_args(
+            rollout_batch_size=2,
+            n_samples_per_prompt=2,
+            harbor_batch_refill_rounds=1,
+            harbor_min_trial_rate=1.0,
+            harbor_service_url=None,
+            harbor_service_urls=["http://h20:9500", "http://h20-2:9500"],
+        )
+        source = FakeDataSource(
+            [make_group("task-a", 2, 0), make_group("task-b", 2, 1)]
+        )
+        calls: list[tuple[str, str, list[str]]] = []
+
+        async def fake_preflight(_args):
+            return None
+
+        async def fake_run_harbor(
+            service_args, label, task_ids, _n_trials, n_targets=None
+        ):
+            calls.append((label, service_args.harbor_service_url, list(task_ids)))
+            return {
+                task_id: [make_trial(task_id)]
+                if "refill" not in label
+                else [make_trial(task_id), make_trial(task_id)]
+                for task_id in task_ids
+            }
+
+        monkeypatch.setattr(rollout_mod, "_preflight_harbor_services", fake_preflight)
+        monkeypatch.setattr(rollout_mod, "_run_harbor", fake_run_harbor)
+
+        out = asyncio.run(_train(args, 0, source))
+
+        assert batch_trials(out) == 4
+        owners: dict[str, set[str]] = {}
+        for _label, service_url, task_ids in calls:
+            for task_id in task_ids:
+                owners.setdefault(task_id, set()).add(service_url)
+        assert owners == {
+            "task-a": {"http://h20:9500"},
+            "task-b": {"http://h20-2:9500"},
+        }
+
+    def test_rejects_a_service_response_with_missing_tasks(self, monkeypatch):
+        args = make_args(
+            harbor_service_url=None,
+            harbor_service_urls=["http://h20:9500", "http://h20-2:9500"],
+        )
+
+        async def fake_run_harbor(
+            service_args, _label, task_ids, _n_trials, n_targets=None
+        ):
+            if service_args.harbor_service_url.endswith("h20:9500"):
+                return {}
+            return {task_id: [] for task_id in task_ids}
+
+        monkeypatch.setattr(rollout_mod, "_run_harbor", fake_run_harbor)
+
+        with pytest.raises(RuntimeError, match="missing task ids.*task-a"):
+            asyncio.run(
+                rollout_mod._run_harbor_distributed(
+                    args, "rollout_0", ["task-a", "task-b"], 2
+                )
+            )
+
+    def test_singular_and_plural_flags_cannot_be_combined(self):
+        args = make_args(harbor_service_urls=["http://h20-2:9500"])
+
+        with pytest.raises(RuntimeError, match="cannot be used together"):
+            rollout_mod._harbor_service_urls(args)
+
+    def test_rejects_duplicate_task_ids(self):
+        with pytest.raises(RuntimeError, match="duplicate task ids.*task-a"):
+            asyncio.run(
+                rollout_mod._run_harbor_distributed(
+                    make_args(), "rollout_0", ["task-a", "task-a"], 2
+                )
+            )
+
+
+class TestHarborPoolPreflight:
+    def test_requires_unique_runner_ids_and_matching_profiles(self, monkeypatch):
+        args = make_args(
+            harbor_service_url=None,
+            harbor_service_urls=["http://h20:9500", "http://h20-2:9500"],
+        )
+
+        class Response:
+            def __init__(self, body):
+                self._body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        class FakeHttpClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def get(self, url):
+                return Response(
+                    {
+                        "runner_id": "same-runner",
+                        "profile_id": "ddb" if "h20-2" not in url else "swebench",
+                        "model_name": "model",
+                    }
+                )
+
+        monkeypatch.setattr(rollout_mod.httpx, "AsyncClient", FakeHttpClient)
+
+        with pytest.raises(RuntimeError, match="Harbor runner pool mismatch"):
+            asyncio.run(rollout_mod._preflight_harbor_services(args))
+
+
 class TestHarborRequestTimeouts:
     """A step runs for hours, so read/write/pool must stay unbounded -- but an
     unbounded *connect* means a harbor service that is down wedges slime's
@@ -235,6 +460,57 @@ class TestHarborRequestTimeouts:
         assert timeout.read is None, "a step legitimately takes hours"
         assert timeout.write is None
         assert timeout.pool is None
+
+    def test_total_service_deadline_is_finite(self, monkeypatch):
+        class SlowClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def post(self, _url, *, json):
+                await asyncio.sleep(1)
+
+        monkeypatch.setattr(rollout_mod.httpx, "AsyncClient", SlowClient)
+        args = make_args(harbor_service_deadline_secs=0.01)
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(_REAL_RUN_HARBOR(args, "rollout_0", ["task-a"], 2))
+
+    def test_sends_the_configured_bearer_token(self, monkeypatch):
+        seen_headers = []
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"task-a": []}
+
+        class RecordingClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def post(self, _url, *, json, headers):
+                seen_headers.append(headers)
+                return Response()
+
+        monkeypatch.setattr(rollout_mod.httpx, "AsyncClient", RecordingClient)
+        monkeypatch.setenv("HARBOR_RUNNER_TOKEN", "shared-secret")
+
+        asyncio.run(_REAL_RUN_HARBOR(make_args(), "rollout_0", ["task-a"], 2))
+
+        assert seen_headers == [{"Authorization": "Bearer shared-secret"}]
 
 
 class _StopRequest(Exception):
@@ -351,7 +627,9 @@ class TestBatchRefill:
         out, calls = run_train_with(args, source, responder)
 
         assert len(calls) == 1, "at target, so no refill round"
-        assert calls[0][2] == 4, "round 0 still asks for the whole group, not the target"
+        assert calls[0][2] == 4, (
+            "round 0 still asks for the whole group, not the target"
+        )
         assert batch_trials(out) == 2
 
     def test_group_under_the_rate_is_refilled_with_a_full_request(self):
@@ -436,7 +714,9 @@ class TestBatchRefill:
 
         uids = [sample.rollout_id for trial in out.samples[0] for sample in trial]
         assert len(uids) == 3
-        assert len(set(uids)) == 3, "a refilled trial must not reuse a uid from an earlier round"
+        assert len(set(uids)) == 3, (
+            "a refilled trial must not reuse a uid from an earlier round"
+        )
 
     def test_group_still_short_when_the_budget_is_spent_fails_the_step(self):
         args = make_args(
@@ -444,7 +724,9 @@ class TestBatchRefill:
             n_samples_per_prompt=4,
             harbor_min_trial_rate=0.75,
         )
-        source = AdvancingDataSource([make_group("task-a", 4, 0), make_group("task-b", 4, 1)])
+        source = AdvancingDataSource(
+            [make_group("task-a", 4, 0), make_group("task-b", 4, 1)]
+        )
 
         def responder(label, task_ids, n_trials):
             if "refill" in label:
@@ -599,7 +881,9 @@ class TestTrialOverSampling:
         out, _ = run_train_with(args, source, responder)
 
         indices = [s.index for trial in out.samples[0] for s in trial]
-        assert sorted(indices) == [0, 1, 2, 3], f"collided on one prompt copy: {indices}"
+        assert sorted(indices) == [0, 1, 2, 3], (
+            f"collided on one prompt copy: {indices}"
+        )
 
     def test_the_refill_path_gets_distinct_indices_too(self):
         """Same fix on the refill path: a refill round's trial_index also
@@ -1049,7 +1333,9 @@ class TestUnscoredTrials:
         out = run_train(args, source, {"task-a": [unscored, scored]})
 
         [[[sample]]] = out.samples
-        assert sample.reward == 0.9, "the scored trial was kept, not the unscored one before it"
+        assert sample.reward == 0.9, (
+            "the scored trial was kept, not the unscored one before it"
+        )
 
     def test_a_reply_of_only_unscored_trials_costs_a_refill_round(self):
         args = make_args(rollout_batch_size=1)
@@ -1116,7 +1402,9 @@ class TestUnscoredTrials:
         out = run_train(args, source, {"task-a": [trial]})
 
         [[[sample]]] = out.samples
-        assert sample.reward == pytest.approx(0.4), "the verifier-unscored trial was kept"
+        assert sample.reward == pytest.approx(0.4), (
+            "the verifier-unscored trial was kept"
+        )
 
     def test_a_missing_unselected_score_costs_nothing(self):
         """The other half of the contract: only the score the RM reads is
@@ -1140,11 +1428,19 @@ class TestVerifierComponentMetrics:
         merges RolloutFnTrainOutput.metrics into the per-step wandb log
         (_log_rollout_data), beside its own rollout/*."""
         args = make_args()
-        source = FakeDataSource([make_group("task-a", 1, 0), make_group("task-b", 1, 1)])
+        source = FakeDataSource(
+            [make_group("task-a", 1, 0), make_group("task-b", 1, 1)]
+        )
         trial_a = make_trial("task-a")
-        trial_a.verifier_components = {"code_review_score": 12.0, "vlm_static_score": 1.0}
+        trial_a.verifier_components = {
+            "code_review_score": 12.0,
+            "vlm_static_score": 1.0,
+        }
         trial_b = make_trial("task-b")
-        trial_b.verifier_components = {"code_review_score": 8.0, "vlm_static_score": 0.5}
+        trial_b.verifier_components = {
+            "code_review_score": 8.0,
+            "vlm_static_score": 0.5,
+        }
 
         out = run_train(args, source, {"task-a": [trial_a], "task-b": [trial_b]})
 
@@ -1190,14 +1486,20 @@ class TestStepCounterMetrics:
 
     @staticmethod
     def skip_total(metrics) -> int:
-        return sum(v for k, v in metrics.items() if k.startswith("harbor/trials_skipped_"))
+        return sum(
+            v for k, v in metrics.items() if k.startswith("harbor/trials_skipped_")
+        )
 
     def test_a_healthy_step_emits_flat_zero_counters(self):
         args = make_args()
-        source = FakeDataSource([make_group("task-a", 1, 0), make_group("task-b", 1, 1)])
+        source = FakeDataSource(
+            [make_group("task-a", 1, 0), make_group("task-b", 1, 1)]
+        )
 
         out = run_train(
-            args, source, {"task-a": [make_trial("task-a")], "task-b": [make_trial("task-b")]}
+            args,
+            source,
+            {"task-a": [make_trial("task-a")], "task-b": [make_trial("task-b")]},
         )
 
         m = out.metrics
@@ -1206,7 +1508,9 @@ class TestStepCounterMetrics:
         assert m["harbor/trials_requested"] == 2
         assert m["harbor/trials_received"] == 2
         assert m["harbor/refill_rounds_used"] == 0
-        zeros = [key for key in self.COUNTER_KEYS if "skipped" in key or "dropped" in key]
+        zeros = [
+            key for key in self.COUNTER_KEYS if "skipped" in key or "dropped" in key
+        ]
         assert {key: m[key] for key in zeros} == {key: 0 for key in zeros}
 
     def test_counters_span_refill_rounds_skips_and_drops(self):
@@ -1233,12 +1537,16 @@ class TestStepCounterMetrics:
                 }
             unscored = make_trial(task_ids[0])
             unscored.verifier_scores = {}
-            return {task_ids[0]: [TrialRollout(task_id=task_ids[0], error="dead"), unscored]}
+            return {
+                task_ids[0]: [TrialRollout(task_id=task_ids[0], error="dead"), unscored]
+            }
 
         out, _calls = run_train_with(args, source, responder)
 
         m = out.metrics
-        assert m["harbor/trials_requested"] == 4, "two rounds, each asking a full group of 2"
+        assert m["harbor/trials_requested"] == 4, (
+            "two rounds, each asking a full group of 2"
+        )
         assert m["harbor/trials_received"] == 5
         assert m["harbor/trials_kept"] == 2
         assert m["harbor/refill_rounds_used"] == 1
@@ -1246,7 +1554,9 @@ class TestStepCounterMetrics:
         assert m["harbor/trials_skipped_missing_score"] == 1
         assert m["harbor/trials_skipped_untrainable"] == 1
         assert m["harbor/streams_dropped_unsupported_agent"] == 2
-        assert m["harbor/trials_received"] == m["harbor/trials_kept"] + self.skip_total(m)
+        assert m["harbor/trials_received"] == m["harbor/trials_kept"] + self.skip_total(
+            m
+        )
 
     def test_surplus_trials_are_counted_not_converted(self):
         args = make_args(
@@ -1256,14 +1566,18 @@ class TestStepCounterMetrics:
         )
         source = FakeDataSource([make_group("task-a", 2, 0)])
 
-        out = run_train(args, source, {"task-a": [make_trial("task-a") for _ in range(4)]})
+        out = run_train(
+            args, source, {"task-a": [make_trial("task-a") for _ in range(4)]}
+        )
 
         m = out.metrics
         assert m["harbor/trials_requested"] == 4
         assert m["harbor/trials_received"] == 4
         assert m["harbor/trials_kept"] == 2
         assert m["harbor/trials_skipped_surplus"] == 2
-        assert m["harbor/trials_received"] == m["harbor/trials_kept"] + self.skip_total(m)
+        assert m["harbor/trials_received"] == m["harbor/trials_kept"] + self.skip_total(
+            m
+        )
 
     def test_mixed_weight_drop_counts_under_the_allow_flag(self):
         """Without the flag the step raises before metrics exist, so the
@@ -1335,13 +1649,18 @@ class TestEvalOutput:
     def test_eval_reports_the_per_leg_verifier_means(self):
         """The eval reward is the code-review x VLM product; the split behind it
         rides TrialRollout.verifier_components into the eval metrics."""
-        args = make_args(harbor_eval_task_ids=["task-a", "task-b"], harbor_eval_n_samples=1)
+        args = make_args(
+            harbor_eval_task_ids=["task-a", "task-b"], harbor_eval_n_samples=1
+        )
 
         async def fake_run_harbor(_args, _label, task_ids, _n):
             out = {}
             for i, t in enumerate(sorted(task_ids)):
                 trial = make_trial(t, verifier_score=0.75)
-                trial.verifier_components = {"code_review_score": 10.0 + 2 * i, "vlm_static_score": 0.5}
+                trial.verifier_components = {
+                    "code_review_score": 10.0 + 2 * i,
+                    "vlm_static_score": 0.5,
+                }
                 out[t] = [trial]
             return out
 
@@ -1395,7 +1714,9 @@ class TestEvalOutput:
         assert out.metrics["harbor/eval_tasks_no_trials"] == 1
 
     def test_eval_counters_split_received_unscored_and_empty_tasks(self):
-        args = make_args(harbor_eval_task_ids=["task-a", "task-b"], harbor_eval_n_samples=2)
+        args = make_args(
+            harbor_eval_task_ids=["task-a", "task-b"], harbor_eval_n_samples=2
+        )
 
         async def fake_run_harbor(_args, _label, task_ids, _n):
             scored = make_trial("task-a", verifier_score=0.75)
@@ -1453,7 +1774,7 @@ class _FakeOverridesResponse:
 class _FakePutClient:
     """Records PUTs and echoes a scripted (or adopting) effective policy."""
 
-    last: "_FakePutClient | None" = None
+    last: _FakePutClient | None = None
     effective: dict[str, Any] | None = None  # None -> echo the pushed body (adopted)
     error: Exception | None = None
 
@@ -1461,7 +1782,7 @@ class _FakePutClient:
         _FakePutClient.last = self
         self.calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 
-    async def __aenter__(self) -> "_FakePutClient":
+    async def __aenter__(self) -> _FakePutClient:
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -1506,9 +1827,13 @@ class TestSyncSamplingOverrides:
         with pytest.raises(RuntimeError, match="--harbor-proxy-url"):
             asyncio.run(rollout_mod._sync_sampling_overrides(args, 0))
 
-    def test_flags_without_proxy_api_key_fail_loudly(self, fake_put_client, monkeypatch):
+    def test_flags_without_proxy_api_key_fail_loudly(
+        self, fake_put_client, monkeypatch
+    ):
         monkeypatch.delenv("PROXY_API_KEY")
-        args = make_args(harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0)
+        args = make_args(
+            harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0
+        )
 
         with pytest.raises(RuntimeError, match="PROXY_API_KEY"):
             asyncio.run(rollout_mod._sync_sampling_overrides(args, 0))
@@ -1529,14 +1854,18 @@ class TestSyncSamplingOverrides:
 
     def test_unreachable_proxy_fails_the_step(self, fake_put_client):
         fake_put_client.error = httpx.ConnectError("nobody home")
-        args = make_args(harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0)
+        args = make_args(
+            harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0
+        )
 
         with pytest.raises(RuntimeError, match="cannot push sampling overrides"):
             asyncio.run(rollout_mod._sync_sampling_overrides(args, 0))
 
     def test_unadopted_policy_fails_the_step(self, fake_put_client):
         fake_put_client.effective = {"temperature": 0.7}
-        args = make_args(harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0)
+        args = make_args(
+            harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0
+        )
 
         with pytest.raises(RuntimeError, match="did not adopt"):
             asyncio.run(rollout_mod._sync_sampling_overrides(args, 0))
@@ -1545,12 +1874,16 @@ class TestSyncSamplingOverrides:
         """The proxy YAML baseline may pin keys the flags do not -- that is
         the intended layering, not a mismatch."""
         fake_put_client.effective = {"temperature": 1.0, "top_p": 1.0}
-        args = make_args(harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0)
+        args = make_args(
+            harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_temperature=1.0
+        )
 
         asyncio.run(rollout_mod._sync_sampling_overrides(args, 0))
 
     def test_truncating_top_p_warns_but_proceeds(self, fake_put_client, caplog):
-        args = make_args(harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_top_p=0.95)
+        args = make_args(
+            harbor_proxy_url="http://127.0.0.1:9400", harbor_sampling_top_p=0.95
+        )
 
         with caplog.at_level("WARNING", logger=rollout_mod.logger.name):
             asyncio.run(rollout_mod._sync_sampling_overrides(args, 0))

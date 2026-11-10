@@ -1,14 +1,13 @@
 """Score per-leaf verdicts on a rubric tree from rubrics-tree-generation.
 
-Gate, then flat rate, as in the generator's reference scorer (rubric_tree/score.py):
-a failed critical leaf sets the score to 0; else the score is the pass rate,
-and every leaf has the same weight. Branches only group leaves.
+The score is the weighted pass rate: critical leaves have weight 2 and other
+leaves have weight 1. A critical failure does not force the score to zero.
+Branches only group leaves; diagnostic pass rates remain unweighted.
 
 The judge can leave a leaf UNKNOWN when it could not reach the check. Such a
 leaf has no verdict. A critical leaf without a verdict, or coverage below
 ``min_coverage``, makes the score unavailable: a missing measurement must not
-become a training reward. Else the pass rate is over the leaves with a verdict.
-With ``min_coverage=1`` this is the reference scorer exactly.
+become a training reward. The weighted pass rate uses leaves with a verdict.
 """
 
 from __future__ import annotations
@@ -74,6 +73,15 @@ def score_tree(
     ]
     coverage = len(resolved) / len(leaves)
     n_pass = sum(resolved.values())
+    resolved_weights = {
+        leaf["id"]: 2 if leaf["critical"] else 1
+        for leaf in leaves
+        if leaf["id"] in resolved
+    }
+    total_weight = sum(resolved_weights.values())
+    passed_weight = sum(
+        weight for leaf_id, weight in resolved_weights.items() if resolved[leaf_id]
+    )
     branches = {}
     for branch in BRANCHES:
         results = [
@@ -95,8 +103,6 @@ def score_tree(
             for verdict in VERDICTS
         },
     }
-    if failed_critical:
-        return {**result, "status": "completed", "score": 0.0}
     if unresolved_critical:
         return {
             **result,
@@ -111,4 +117,8 @@ def score_tree(
             "score": None,
             "error": f"Coverage {coverage:.2f} is below {min_coverage:.2f}",
         }
-    return {**result, "status": "completed", "score": result["pass_rate"]}
+    return {
+        **result,
+        "status": "completed",
+        "score": passed_weight / total_weight if total_weight else None,
+    }

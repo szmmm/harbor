@@ -17,10 +17,10 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("fastapi", reason="service extras not installed")
-import httpx  # noqa: E402
+import httpx
 
-from harbor.slime_bridge.cli import build_app  # noqa: E402
-from harbor.slime_bridge.trial import TrialRollout  # noqa: E402
+from harbor.slime_bridge.cli import build_app, runner_jobs_dir
+from harbor.slime_bridge.trial import TrialRollout
 
 
 @dataclass
@@ -41,8 +41,12 @@ class FakeClient:
 
     async def run(self, task_ids, *, n_attempts=1, run_label=None, n_targets=None):
         self.calls.append(
-            {"task_ids": task_ids, "n_attempts": n_attempts, "run_label": run_label,
-             "n_targets": n_targets}
+            {
+                "task_ids": task_ids,
+                "n_attempts": n_attempts,
+                "run_label": run_label,
+                "n_targets": n_targets,
+            }
         )
         if self._delay:
             await asyncio.sleep(self._delay)
@@ -66,10 +70,14 @@ class FakeClient:
         }
 
 
-def _request(client: FakeClient, method: str, path: str, **kwargs) -> httpx.Response:
+def _request(
+    client: FakeClient, method: str, path: str, *, app_kwargs=None, **kwargs
+) -> httpx.Response:
     async def go() -> httpx.Response:
-        transport = httpx.ASGITransport(app=build_app(client))
-        async with httpx.AsyncClient(transport=transport, base_url="http://svc") as http:
+        transport = httpx.ASGITransport(app=build_app(client, **(app_kwargs or {})))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://svc"
+        ) as http:
             return await http.request(method, path, **kwargs)
 
     return asyncio.run(go())
@@ -85,14 +93,21 @@ class TestRolloutBodyBinding:
             client,
             "POST",
             "/rollout",
-            json={"task_ids": ["task-000001"], "n_attempts": 2,
-                  "run_label": "rollout_7"},
+            json={
+                "task_ids": ["task-000001"],
+                "n_attempts": 2,
+                "run_label": "rollout_7",
+            },
         )
 
         assert response.status_code == 200, response.text
         assert client.calls == [
-            {"task_ids": ["task-000001"], "n_attempts": 2,
-             "run_label": "rollout_7", "n_targets": None}
+            {
+                "task_ids": ["task-000001"],
+                "n_attempts": 2,
+                "run_label": "rollout_7",
+                "n_targets": None,
+            }
         ]
 
     def test_body_is_not_demoted_to_a_query_parameter(self):
@@ -115,7 +130,9 @@ class TestRolloutBodyBinding:
     def test_response_round_trips_back_into_trial_rollouts(self):
         """What the trainer actually does with the body."""
         response = _request(
-            FakeClient(), "POST", "/rollout",
+            FakeClient(),
+            "POST",
+            "/rollout",
             json={"task_ids": ["task-000001"], "n_attempts": 1},
         )
 
@@ -136,7 +153,9 @@ class TestValidation:
 
     def test_zero_attempts_is_rejected(self):
         response = _request(
-            FakeClient(), "POST", "/rollout",
+            FakeClient(),
+            "POST",
+            "/rollout",
             json={"task_ids": ["t"], "n_attempts": 0},
         )
 
@@ -158,9 +177,14 @@ class TestNTargets:
         client = FakeClient()
 
         response = _request(
-            client, "POST", "/rollout",
-            json={"task_ids": ["a", "b"], "n_attempts": 6,
-                  "n_targets": {"a": 4, "b": 2}},
+            client,
+            "POST",
+            "/rollout",
+            json={
+                "task_ids": ["a", "b"],
+                "n_attempts": 6,
+                "n_targets": {"a": 4, "b": 2},
+            },
         )
 
         assert response.status_code == 200, response.text
@@ -179,7 +203,9 @@ class TestNTargets:
         client = FakeClient(raises=ValueError("n_targets must be >= 1, got {'a': 0}"))
 
         response = _request(
-            client, "POST", "/rollout",
+            client,
+            "POST",
+            "/rollout",
             json={"task_ids": ["a"], "n_targets": {"a": 0}},
         )
 
@@ -188,7 +214,9 @@ class TestNTargets:
 
     def test_a_non_mapping_target_is_a_422(self):
         response = _request(
-            FakeClient(), "POST", "/rollout",
+            FakeClient(),
+            "POST",
+            "/rollout",
             json={"task_ids": ["a"], "n_targets": [4]},
         )
 
@@ -206,6 +234,66 @@ class TestHealth:
         assert body["n_concurrent_trials"] == 4
         assert body["model_name"] == "rl-exp-model"
 
+    def test_reports_runner_and_profile_identity(self):
+        response = _request(
+            FakeClient(),
+            "GET",
+            "/health",
+            app_kwargs={"runner_id": "h20-2", "profile_id": "ddb"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["runner_id"] == "h20-2"
+        assert response.json()["profile_id"] == "ddb"
+
+
+class TestAuthentication:
+    def test_rollout_requires_the_configured_bearer_token(self):
+        kwargs = {"app_kwargs": {"auth_token": "shared-secret"}}
+
+        missing = _request(
+            FakeClient(), "POST", "/rollout", json={"task_ids": ["a"]}, **kwargs
+        )
+        wrong = _request(
+            FakeClient(),
+            "POST",
+            "/rollout",
+            json={"task_ids": ["a"]},
+            headers={"Authorization": "Bearer wrong"},
+            **kwargs,
+        )
+        accepted = _request(
+            FakeClient(),
+            "POST",
+            "/rollout",
+            json={"task_ids": ["a"]},
+            headers={"Authorization": "Bearer shared-secret"},
+            **kwargs,
+        )
+
+        assert missing.status_code == 401
+        assert wrong.status_code == 401
+        assert accepted.status_code == 200
+
+    def test_health_remains_available_without_authentication(self):
+        response = _request(
+            FakeClient(),
+            "GET",
+            "/health",
+            app_kwargs={"auth_token": "shared-secret"},
+        )
+
+        assert response.status_code == 200
+
+
+class TestRunnerJobsDir:
+    def test_namespaces_jobs_by_runner(self):
+        assert runner_jobs_dir(Path("/jobs"), "h20-2") == Path("/jobs/h20-2")
+
+    def test_rejects_a_path_like_runner_id(self):
+        with pytest.raises(ValueError, match="invalid runner id"):
+            runner_jobs_dir(Path("/jobs"), "../h20")
+
 
 class TestOneStepAtATime:
     def test_a_second_concurrent_rollout_gets_409(self):
@@ -216,7 +304,9 @@ class TestOneStepAtATime:
 
         async def go():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://svc") as http:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://svc"
+            ) as http:
                 first = asyncio.create_task(
                     http.post("/rollout", json={"task_ids": ["a"], "run_label": "one"})
                 )
@@ -241,7 +331,9 @@ class TestOneStepAtATime:
 
         async def go():
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://svc") as http:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://svc"
+            ) as http:
                 running = asyncio.create_task(
                     http.post("/rollout", json={"task_ids": ["a"]})
                 )

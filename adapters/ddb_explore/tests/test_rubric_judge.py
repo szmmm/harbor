@@ -131,21 +131,22 @@ def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
     assert len(client.requests) == 3 and result["request_retries"] == 2
 
 
-def test_score_is_flat_pass_rate():
+def test_score_weights_critical_leaves_twice():
     result = score_tree(
         LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"}, min_coverage=1
     )
     assert result["status"] == "completed"
-    assert result["score"] == pytest.approx(4 / 5)
+    assert result["score"] == pytest.approx(5 / 6)
+    assert result["pass_rate"] == pytest.approx(4 / 5)
     assert result["branches"]["static"] == pytest.approx(0.5)
     assert result["branches"]["content"] is None
 
 
-def test_failed_critical_leaf_gates_to_zero_even_with_gaps():
+def test_failed_critical_leaf_does_not_bypass_coverage():
     result = score_tree(LEAVES, {"I.1": "FAIL"}, min_coverage=0.9)
     assert (result["status"], result["score"], result["failed_critical"]) == (
-        "completed",
-        0.0,
+        "incomplete",
+        None,
         ["I.1"],
     )
 
@@ -160,7 +161,7 @@ def test_low_coverage_has_no_score_and_enough_coverage_scores_resolved_leaves():
     verdicts = {"I.1": "PASS", "S.1.1": "PASS", "S.1.2": "FAIL", "D.B.1": "PASS"}
     assert score_tree(LEAVES, verdicts, min_coverage=0.9)["score"] is None
     result = score_tree(LEAVES, verdicts, min_coverage=0.8)
-    assert result["score"] == pytest.approx(3 / 4)
+    assert result["score"] == pytest.approx(4 / 5)
     assert result["counts"] == {"PASS": 3, "FAIL": 1, "UNKNOWN": 1}
 
 
@@ -810,7 +811,7 @@ def test_critical_fail_does_not_stop_exploration(tmp_path):
         ],
         max_steps=2,
     )
-    assert result["score"] == 0
+    assert result["score"] is None and result["status"] == "evaluator_failed"
     assert len(result["evidence"]) == 2 and len(client.requests) == 3
 
 
@@ -879,5 +880,5 @@ def test_finish_skips_later_calls_in_same_response(tmp_path):
             ]
         ],
     )
-    assert result["score"] == 0 and result["finished_by_model"]
+    assert result["score"] is None and result["finished_by_model"]
     assert len(client.requests) == 1 and len(result["evidence"]) == 1

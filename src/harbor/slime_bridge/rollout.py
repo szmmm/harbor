@@ -7,23 +7,30 @@ this a hard barrier -- ``ray.get(rollout_manager.generate.remote(rollout_id))``
 returns before ``train()`` and ``update_weights()``.
 
 The trials themselves run on the harbor service (``harbor.slime_bridge.cli``) over HTTP,
-set by ``--harbor-service-url``.
+set by ``--harbor-service-url`` or ``--harbor-service-urls``.
 """
 
 from __future__ import annotations
 
-import os
+import asyncio
+import json
 import logging
 import math
+import os
 from argparse import Namespace
 from collections import Counter
+from collections.abc import Callable, Sequence
+from copy import copy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from pathlib import Path
+from typing import Any
+
 import httpx
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.rm_hub import batched_async_rm
 from slime.utils.async_utils import run
 from slime.utils.types import Sample
+
 from harbor.slime_bridge.convert import (
     DROP_EMPTY,
     DROP_NO_TRAINABLE_TOKENS,
@@ -53,11 +60,24 @@ SKIP_NO_TOKENS = "no_tokens"
 SKIP_MISSING_SCORE = "missing_score"
 SKIP_UNTRAINABLE = "untrainable"
 
-_SKIP_REASONS = (SKIP_SURPLUS, SKIP_MIXED_WEIGHTS, SKIP_NO_TOKENS, SKIP_MISSING_SCORE, SKIP_UNTRAINABLE)
-_DROP_REASONS = (DROP_UNSUPPORTED_AGENT, DROP_EMPTY, DROP_OVER_CAP, DROP_NO_TRAINABLE_TOKENS)
+_SKIP_REASONS = (
+    SKIP_SURPLUS,
+    SKIP_MIXED_WEIGHTS,
+    SKIP_NO_TOKENS,
+    SKIP_MISSING_SCORE,
+    SKIP_UNTRAINABLE,
+)
+_DROP_REASONS = (
+    DROP_UNSUPPORTED_AGENT,
+    DROP_EMPTY,
+    DROP_OVER_CAP,
+    DROP_NO_TRAINABLE_TOKENS,
+)
 
 
-def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+def generate_rollout(
+    args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
+) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
     """Signature per slime's ``--rollout-function-path`` contract.
 
     The training output is ``list[task][trial][agent] -> Sample`` (depth 3).
@@ -88,6 +108,7 @@ class _OpenGroup:
 
     group: list[Sample]
     group_index: int
+    service_url: str
     samples: list[list[Sample]] = field(default_factory=list)
     attempts: int = 0
 
@@ -95,21 +116,30 @@ class _OpenGroup:
 def _target_trials(min_trial_rate: float, n_trials: int) -> int:
     """Usable trials a group needs before it counts as complete."""
     if not (0 < min_trial_rate <= 1):
-        raise ValueError(f"min_trial_rate should be in (0, 1], but we got {min_trial_rate}")
+        raise ValueError(
+            f"min_trial_rate should be in (0, 1], but we got {min_trial_rate}"
+        )
     if min_trial_rate == 1:
         return n_trials
     return min(n_trials, max(2, math.ceil(min_trial_rate * n_trials)))
 
 
-async def _train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutFnTrainOutput:
+async def _train(
+    args: Namespace, rollout_id: int, data_source: Any
+) -> RolloutFnTrainOutput:
     batch_size = args.rollout_batch_size
     n_trials = args.n_samples_per_prompt
     trial_over_sample = getattr(args, "harbor_trial_over_sampling", 0)
     cancel_surplus = getattr(args, "harbor_cancel_surplus_trials", False)
     refill_rounds = getattr(args, "harbor_batch_refill_rounds", 3)
     target = _target_trials(getattr(args, "harbor_min_trial_rate", 1.0), n_trials)
-    max_len = getattr(args, "harbor_max_sample_len", None) or getattr(args, "rollout_max_context_len", None)
+    max_len = getattr(args, "harbor_max_sample_len", None) or getattr(
+        args, "rollout_max_context_len", None
+    )
     allow_mixed_weights = getattr(args, "harbor_allow_mixed_weight_versions", False)
+    service_urls = _harbor_service_urls(args)
+    if len(service_urls) > 1:
+        await _preflight_harbor_services(args)
 
     data: list[list[list[Sample]]] = []
     deferred: list[list[Sample]] = []
@@ -139,10 +169,20 @@ async def _train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutF
     # already drawn (see _dedupe_by_task); the duplicate is deferred and its
     # slot re-drawn.
     while len(open_groups) < batch_size:
-        fresh, task_ids, duplicates = _dedupe_by_task(data_source.get_samples(batch_size - len(open_groups)), seen_tasks)
+        fresh, task_ids, duplicates = _dedupe_by_task(
+            data_source.get_samples(batch_size - len(open_groups)), seen_tasks
+        )
         deferred.extend(duplicates)
         for group, task_id in zip(fresh, task_ids):
-            open_groups[task_id] = _OpenGroup(group=group, group_index=next_group_index)
+            if getattr(args, "harbor_task_route_file", None):
+                service_url = _task_routes_for_ids(args, [task_id])[task_id]
+            else:
+                service_url = service_urls[next_group_index % len(service_urls)]
+            open_groups[task_id] = _OpenGroup(
+                group=group,
+                group_index=next_group_index,
+                service_url=service_url,
+            )
             next_group_index += 1
         if not fresh:
             break
@@ -152,12 +192,21 @@ async def _train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutF
             break
         rounds = round_index + 1
 
-        kept = dict(sorted(Counter(len(g.samples) for g in open_groups.values()).items()))
+        kept = dict(
+            sorted(Counter(len(g.samples) for g in open_groups.values()).items())
+        )
         logger.info(
             "rollout %d round %d/%d: %d group(s) complete of %d, %d pending with kept trials %s, "
             "asking %d trial(s)/task, cap %s",
-            rollout_id, round_index, refill_rounds, len(data), batch_size,
-            len(open_groups), kept, n_trials + trial_over_sample, max_len,
+            rollout_id,
+            round_index,
+            refill_rounds,
+            len(data),
+            batch_size,
+            len(open_groups),
+            kept,
+            n_trials + trial_over_sample,
+            max_len,
         )
 
         # Every pending group is asked for a full group -- n_trials plus the
@@ -170,15 +219,23 @@ async def _train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutF
         # --harbor-cancel-surplus-trials tells the service that same cap as a
         # per-task target, so insurance a task turns out not to need is
         # cancelled mid-flight instead of running to be discarded here.
-        label = f"rollout_{rollout_id}" + (f"_refill{round_index}" if round_index else "")
+        label = f"rollout_{rollout_id}" + (
+            f"_refill{round_index}" if round_index else ""
+        )
         trials_requested += len(open_groups) * (n_trials + trial_over_sample)
-        trials_by_task = await _run_harbor(
+        trials_by_task = await _run_harbor_distributed(
             args,
             label,
             list(open_groups),
             n_trials + trial_over_sample,
+            task_routes={
+                task_id: group.service_url for task_id, group in open_groups.items()
+            },
             n_targets=(
-                {task_id: n_trials - len(g.samples) for task_id, g in open_groups.items()}
+                {
+                    task_id: n_trials - len(g.samples)
+                    for task_id, g in open_groups.items()
+                }
                 if cancel_surplus
                 else None
             ),
@@ -210,7 +267,9 @@ async def _train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutF
     # Anything still open failed its first job and every refill round,
     # zero-trial groups included -- a dead task keeps its slot and re-runs
     # rather than losing it to a fresh draw.
-    short: dict[str, int] = {task_id: len(open_group.samples) for task_id, open_group in open_groups.items()}
+    short: dict[str, int] = {
+        task_id: len(open_group.samples) for task_id, open_group in open_groups.items()
+    }
 
     _return_to_data_source(data_source, deferred)
 
@@ -238,12 +297,18 @@ async def _train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutF
     if len(data) < batch_size:
         logger.warning(
             "rollout %d: short batch, %d/%d groups -- the data source had no more unique tasks",
-            rollout_id, len(data), batch_size,
+            rollout_id,
+            len(data),
+            batch_size,
         )
     await _apply_reward_model(args, data)
     logger.info(
         "rollout %d: %d group(s), %d trial(s) in %d round(s), streams dropped %s",
-        rollout_id, len(data), batch_trials, rounds, dict(sorted(drops.items())),
+        rollout_id,
+        len(data),
+        batch_trials,
+        rounds,
+        dict(sorted(drops.items())),
     )
     # Step counters plus per-leg verifier means over the kept batch, merged into
     # slime's per-step wandb log next to rollout/* (_log_rollout_data).
@@ -288,7 +353,9 @@ async def _apply_reward_model(args: Namespace, data: list[list[list[Sample]]]) -
         sample.reward = float(reward)
 
 
-def _dedupe_by_task(groups: list[list[Sample]], seen: set[str]) -> tuple[list[list[Sample]], list[str], list[list[Sample]]]:
+def _dedupe_by_task(
+    groups: list[list[Sample]], seen: set[str]
+) -> tuple[list[list[Sample]], list[str], list[list[Sample]]]:
     """Keep one group per task id; return the rest to be deferred.
 
     ``get_samples`` concatenates the tail of one shuffled epoch with the head of
@@ -343,7 +410,11 @@ def _return_to_data_source(data_source: Any, groups: list[list[Sample]]) -> None
     try:
         add_samples(groups)
     except Exception as exc:  # read-only source, or a group-size mismatch
-        logger.warning("could not return %d unused prompt group(s) to the data source: %s", len(groups), exc)
+        logger.warning(
+            "could not return %d unused prompt group(s) to the data source: %s",
+            len(groups),
+            exc,
+        )
 
 
 def _check_weight_versions(
@@ -378,15 +449,26 @@ def _check_weight_versions(
         f"Proxy session {trial.session_id}."
     )
     if not allow_mixed:
-        raise RuntimeError(message + " Refusing to train on it. slime's loop is a hard barrier, so this means a request outlived generate_rollout.")
+        raise RuntimeError(
+            message
+            + " Refusing to train on it. slime's loop is a hard barrier, so this means a request outlived generate_rollout."
+        )
     logger.error("%s Dropping it (--harbor-allow-mixed-weight-versions).", message)
     return False
 
 
 def _trial_has_score(trial: TrialRollout, key: str) -> bool:
     """Whether every stream this trial could train carries the RM's score."""
-    scores = trial.trajectory_scores if key == TRAJECTORY_SCORE_KEY else trial.verifier_scores
-    return all(scores.get(agent_id) is not None for agent_id in trial.token_ids if is_trained_agent(agent_id))
+    scores = (
+        trial.trajectory_scores
+        if key == TRAJECTORY_SCORE_KEY
+        else trial.verifier_scores
+    )
+    return all(
+        scores.get(agent_id) is not None
+        for agent_id in trial.token_ids
+        if is_trained_agent(agent_id)
+    )
 
 
 def _samples_for_task(
@@ -434,13 +516,20 @@ def _samples_for_task(
             continue
         trial_index = first_trial_index + offset
 
-        if not _check_weight_versions(trial, task_id, trial_index, allow_mixed=allow_mixed_weights):
+        if not _check_weight_versions(
+            trial, task_id, trial_index, allow_mixed=allow_mixed_weights
+        ):
             if on_skip is not None:
                 on_skip(SKIP_MIXED_WEIGHTS)
             continue
 
         if not trial.has_tokens:
-            logger.warning("task %s trial %d: no token data (%s)", task_id, trial_index, trial.error)
+            logger.warning(
+                "task %s trial %d: no token data (%s)",
+                task_id,
+                trial_index,
+                trial.error,
+            )
             if on_skip is not None:
                 on_skip(SKIP_NO_TOKENS)
             continue
@@ -449,7 +538,11 @@ def _samples_for_task(
             logger.warning(
                 "task %s trial %d (%s): recorded token streams but no %s -- "
                 "--custom-rm-path would fail the step on it, so it is not kept (error=%s)",
-                task_id, trial_index, trial.trial_name, required_score, trial.error,
+                task_id,
+                trial_index,
+                trial.trial_name,
+                required_score,
+                trial.error,
             )
             if on_skip is not None:
                 on_skip(SKIP_MISSING_SCORE)
@@ -474,8 +567,11 @@ def _samples_for_task(
             logger.warning(
                 "task %s trial %d: %d recorded agent stream(s) %s but none trainable "
                 "(no supported role, all prompt-only, or all over the %s-token cap)",
-                task_id, trial_index, len(trial.token_ids),
-                sorted({agent_name_of(a) for a in trial.token_ids}), max_len,
+                task_id,
+                trial_index,
+                len(trial.token_ids),
+                sorted({agent_name_of(a) for a in trial.token_ids}),
+                max_len,
             )
             if on_skip is not None:
                 on_skip(SKIP_UNTRAINABLE)
@@ -567,7 +663,11 @@ async def _sync_sampling_overrides(args: Namespace, rollout_id: int) -> None:
             f"overrides: {mismatched} (requested, effective) -- is it an older proxy build, or "
             f"is a different policy pinned in its config?"
         )
-    logger.info("rollout %d: sampling overrides in effect at the proxy: %s", rollout_id, effective)
+    logger.info(
+        "rollout %d: sampling overrides in effect at the proxy: %s",
+        rollout_id,
+        effective,
+    )
 
 
 async def _run_harbor(
@@ -584,22 +684,35 @@ async def _run_harbor(
     """
     service_url = getattr(args, "harbor_service_url", None)
     if not service_url:
-        raise RuntimeError("--harbor-service-url is required: harbor.slime_bridge drives harbor over HTTP.")
+        raise RuntimeError(
+            "--harbor-service-url is required: harbor.slime_bridge drives harbor over HTTP."
+        )
+
+    deadline = getattr(args, "harbor_service_deadline_secs", 86400.0)
+    if deadline <= 0:
+        raise RuntimeError("--harbor-service-deadline-secs must be greater than zero.")
 
     body: dict[str, Any] = {
         "task_ids": task_ids,
         "n_attempts": n_trials,
         "run_label": run_label,
     }
-    if n_targets:
+    if n_targets is not None and len(n_targets) > 0:
         body["n_targets"] = n_targets
-    async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=30.0)) as client:
-        response = await client.post(
-            f"{str(service_url).rstrip('/')}/rollout",
-            json=body,
-        )
-        response.raise_for_status()
-        payload = response.json()
+    token = os.getenv("HARBOR_RUNNER_TOKEN")
+    request_kwargs: dict[str, Any] = {"json": body}
+    if token is not None and token != "":
+        request_kwargs["headers"] = {"Authorization": f"Bearer {token}"}
+    async with asyncio.timeout(deadline):
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(None, connect=30.0)
+        ) as client:
+            response = await client.post(
+                f"{str(service_url).rstrip('/')}/rollout",
+                **request_kwargs,
+            )
+            response.raise_for_status()
+            payload = response.json()
     return {
         task_id: [TrialRollout.from_dict(t) for t in trials]
         for task_id, trials in payload.items()
@@ -609,6 +722,206 @@ async def _run_harbor(
 # ---------------------------------------------------------------------------
 # Evaluation rollout
 # ---------------------------------------------------------------------------
+
+
+def _harbor_service_urls(args: Namespace) -> list[str]:
+    """Return the configured runner URLs, preserving singular compatibility."""
+    singular = getattr(args, "harbor_service_url", None)
+    plural = getattr(args, "harbor_service_urls", None)
+    if singular and plural:
+        raise RuntimeError(
+            "--harbor-service-url and --harbor-service-urls cannot be used together."
+        )
+    urls = list(plural or ([singular] if singular else []))
+    if not urls:
+        raise RuntimeError(
+            "--harbor-service-url or --harbor-service-urls is required: "
+            "harbor.slime_bridge drives harbor over HTTP."
+        )
+    normalized = [str(url).rstrip("/") for url in urls]
+    if any(not url for url in normalized):
+        raise RuntimeError("Harbor service URLs must not be empty.")
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError("--harbor-service-urls must not contain duplicates.")
+    return normalized
+
+
+def _task_routes_for_ids(args: Namespace, task_ids: list[str]) -> dict[str, str]:
+    """Resolve task ids to configured services, using a fixed manifest when set."""
+    service_urls = _harbor_service_urls(args)
+    route_file = getattr(args, "harbor_task_route_file", None)
+    if not route_file:
+        return {
+            task_id: service_urls[index % len(service_urls)]
+            for index, task_id in enumerate(task_ids)
+        }
+
+    try:
+        manifest = json.loads(Path(route_file).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot read Harbor task route manifest {route_file!r}: {exc}"
+        ) from exc
+    if manifest.get("schema_version") != 1:
+        raise RuntimeError("Harbor task route manifest schema_version must be 1.")
+    runners = manifest.get("runners")
+    tasks = manifest.get("tasks")
+    if not isinstance(runners, dict) or not isinstance(tasks, dict):
+        raise RuntimeError(  # noqa: TRY004 -- malformed configuration, consistent routing error
+            "Harbor task route manifest requires object fields runners and tasks."
+        )
+
+    missing = sorted(set(task_ids) - set(tasks))
+    if missing:
+        raise RuntimeError(
+            f"Harbor task route manifest is missing requested task ids: {missing}."
+        )
+
+    routes: dict[str, str] = {}
+    for task_id in task_ids:
+        task = tasks[task_id]
+        runner_id = task.get("runner") if isinstance(task, dict) else None
+        runner = runners.get(runner_id) if runner_id else None
+        service_url = runner.get("service_url") if isinstance(runner, dict) else None
+        if not service_url:
+            raise RuntimeError(
+                f"Harbor task {task_id!r} references unknown runner {runner_id!r}."
+            )
+        service_url = str(service_url).rstrip("/")
+        if service_url not in service_urls:
+            raise RuntimeError(
+                f"Harbor task {task_id!r} is routed to unconfigured service {service_url!r}."
+            )
+        routes[task_id] = service_url
+    return routes
+
+
+async def _run_harbor_distributed(
+    args: Namespace,
+    run_label: str,
+    task_ids: list[str],
+    n_trials: int,
+    *,
+    task_routes: dict[str, str] | None = None,
+    n_targets: dict[str, int] | None = None,
+) -> dict[str, list[TrialRollout]]:
+    """Partition one rollout across runners and merge only complete responses."""
+    service_urls = _harbor_service_urls(args)
+    duplicate_task_ids = sorted(
+        task_id for task_id, count in Counter(task_ids).items() if count > 1
+    )
+    if duplicate_task_ids:
+        raise RuntimeError(
+            f"Harbor rollout request contains duplicate task ids: {duplicate_task_ids}."
+        )
+    if task_routes is None:
+        task_routes = _task_routes_for_ids(args, task_ids)
+    if set(task_routes) != set(task_ids):
+        missing = sorted(set(task_ids) - set(task_routes))
+        unexpected = sorted(set(task_routes) - set(task_ids))
+        raise RuntimeError(
+            f"Harbor task routes do not match request: missing={missing}, unexpected={unexpected}."
+        )
+
+    partitions: dict[str, list[str]] = {url: [] for url in service_urls}
+    for task_id in task_ids:
+        service_url = str(task_routes[task_id]).rstrip("/")
+        if service_url not in partitions:
+            raise RuntimeError(
+                f"Harbor task {task_id!r} is routed to unconfigured service {service_url!r}."
+            )
+        partitions[service_url].append(task_id)
+
+    async def run_partition(
+        service_url: str, assigned: list[str]
+    ) -> dict[str, list[TrialRollout]]:
+        service_args = copy(args)
+        service_args.harbor_service_url = service_url
+        service_args.harbor_service_urls = None
+        targets = (
+            {
+                task_id: n_targets[task_id]
+                for task_id in assigned
+                if task_id in n_targets
+            }
+            if n_targets is not None
+            else None
+        )
+        if targets is not None and len(targets) > 0:
+            return await _run_harbor(
+                service_args,
+                run_label,
+                assigned,
+                n_trials,
+                n_targets=targets,
+            )
+        return await _run_harbor(service_args, run_label, assigned, n_trials)
+
+    tasks: dict[str, asyncio.Task[dict[str, list[TrialRollout]]]] = {}
+    async with asyncio.TaskGroup() as task_group:
+        for service_url, assigned in partitions.items():
+            if assigned:
+                tasks[service_url] = task_group.create_task(
+                    run_partition(service_url, assigned)
+                )
+
+    merged: dict[str, list[TrialRollout]] = {}
+    for service_url, task in tasks.items():
+        response = task.result()
+        assigned = set(partitions[service_url])
+        returned = set(response)
+        if assigned != returned:
+            missing = sorted(assigned - returned)
+            unexpected = sorted(returned - assigned)
+            raise RuntimeError(
+                f"Harbor service {service_url} returned incomplete task ids: "
+                f"missing task ids {missing}, unexpected task ids {unexpected}."
+            )
+        merged.update(response)
+    return {task_id: merged[task_id] for task_id in task_ids}
+
+
+async def _preflight_harbor_services(args: Namespace) -> None:
+    """Fail before rollout when a multi-runner pool is inconsistent."""
+    service_urls = _harbor_service_urls(args)
+    if len(service_urls) < 2:
+        return
+
+    async with (
+        httpx.AsyncClient(timeout=30.0) as client,
+        asyncio.TaskGroup() as task_group,
+    ):
+        tasks = {
+            service_url: task_group.create_task(client.get(f"{service_url}/health"))
+            for service_url in service_urls
+        }
+
+    identities: dict[str, dict[str, Any]] = {}
+    for service_url, task in tasks.items():
+        response = task.result()
+        response.raise_for_status()
+        identities[service_url] = response.json()
+
+    required = {"runner_id", "profile_id", "model_name"}
+    missing_fields = {
+        url: sorted(required - set(identity))
+        for url, identity in identities.items()
+        if required - set(identity)
+    }
+    runner_ids = [identity.get("runner_id") for identity in identities.values()]
+    profiles = {identity.get("profile_id") for identity in identities.values()}
+    models = {identity.get("model_name") for identity in identities.values()}
+    if (
+        missing_fields
+        or len(set(runner_ids)) != len(runner_ids)
+        or len(profiles) != 1
+        or len(models) != 1
+    ):
+        raise RuntimeError(
+            "Harbor runner pool mismatch: runners must have unique runner_id values "
+            "and matching profile_id/model_name values; "
+            f"health={identities}, missing_fields={missing_fields}."
+        )
 
 
 async def _eval(args: Namespace, rollout_id: int) -> RolloutFnEvalOutput:
@@ -624,12 +937,18 @@ async def _eval(args: Namespace, rollout_id: int) -> RolloutFnEvalOutput:
     """
     task_ids = getattr(args, "harbor_eval_task_ids", None)
     if not task_ids:
-        logger.warning("no --harbor-eval-task-ids configured; skipping eval %d", rollout_id)
+        logger.warning(
+            "no --harbor-eval-task-ids configured; skipping eval %d", rollout_id
+        )
         return RolloutFnEvalOutput(data={})
 
     n_trials = getattr(args, "harbor_eval_n_samples", 1)
+    if len(_harbor_service_urls(args)) > 1:
+        await _preflight_harbor_services(args)
     await _sync_sampling_overrides(args, rollout_id)
-    trials_by_task = await _run_harbor(args, f"eval_{rollout_id}", list(task_ids), n_trials)
+    trials_by_task = await _run_harbor_distributed(
+        args, f"eval_{rollout_id}", list(task_ids), n_trials
+    )
 
     rewards: list[float] = []
     trajectory_scores: list[float] = []
@@ -670,7 +989,8 @@ async def _eval(args: Namespace, rollout_id: int) -> RolloutFnEvalOutput:
     if not rewards:
         logger.warning(
             "eval %d: %d task(s) produced no scored trial -- reporting no eval metrics for this step.",
-            rollout_id, len(task_ids),
+            rollout_id,
+            len(task_ids),
         )
         return RolloutFnEvalOutput(data={}, metrics=metrics)
 
@@ -687,11 +1007,16 @@ async def _eval(args: Namespace, rollout_id: int) -> RolloutFnEvalOutput:
         metrics["harbor/eval_trajectory_score_mean"] = _mean(trajectory_scores)
     # Per-leg verifier means over the same trials the rewards came from. Monitoring only.
     metrics.update(
-        {f"harbor/eval_{key}_mean": _mean(values) for key, values in sorted(component_scores.items())}
+        {
+            f"harbor/eval_{key}_mean": _mean(values)
+            for key, values in sorted(component_scores.items())
+        }
     )
     logger.info(
         "eval %d: %d trial(s), mean verifier score %.4f, mean trajectory score %s",
-        rollout_id, len(rewards), sum(rewards) / len(rewards),
+        rollout_id,
+        len(rewards),
+        sum(rewards) / len(rewards),
         f"{_mean(trajectory_scores):.4f}" if trajectory_scores else "n/a",
     )
     return RolloutFnEvalOutput(data=data, metrics=metrics)
@@ -713,7 +1038,9 @@ def task_id_of(sample: Sample) -> str:
     metadata = sample.metadata or {}
     task_id = metadata.get("task_id")
     if not task_id:
-        raise ValueError("prompt dataset row has no metadata.task_id; harbor.slime_bridge needs it to locate the task directory in the service's dataset.")
+        raise ValueError(
+            "prompt dataset row has no metadata.task_id; harbor.slime_bridge needs it to locate the task directory in the service's dataset."
+        )
     return str(task_id)
 
 
@@ -757,7 +1084,9 @@ def _train_counter_metrics(
     return metrics
 
 
-def _batch_verifier_components(data: list[list[list[Sample]]]) -> dict[str, list[float]]:
+def _batch_verifier_components(
+    data: list[list[list[Sample]]],
+) -> dict[str, list[float]]:
     """Per-leg verifier scores of the batch's kept trials, keyed by component.
 
     One value per trial: the components are trial-level (reward.json), so a
@@ -766,7 +1095,9 @@ def _batch_verifier_components(data: list[list[list[Sample]]]) -> dict[str, list
     per_key: dict[str, list[float]] = {}
     for group in data:
         for trial_samples in group:
-            components = (trial_samples[0].metadata or {}).get("verifier_components") or {}
+            components = (trial_samples[0].metadata or {}).get(
+                "verifier_components"
+            ) or {}
             for key, value in components.items():
                 per_key.setdefault(key, []).append(float(value))
     return per_key

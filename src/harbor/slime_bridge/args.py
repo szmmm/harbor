@@ -25,6 +25,28 @@ def add_harbor_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="Harbor rollout service, e.g. http://127.0.0.1:9500. REQUIRED for a "
         "training or eval rollout -- _run_harbor raises without it.",
     )
+    group.add_argument(
+        "--harbor-service-urls",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Harbor rollout services for multi-node rollout. Tasks are assigned "
+        "round-robin and keep the same service across refill rounds. Mutually "
+        "exclusive with --harbor-service-url.",
+    )
+    group.add_argument(
+        "--harbor-service-deadline-secs",
+        type=float,
+        default=86400.0,
+        help="Overall deadline for one Harbor service request (default: 24 hours).",
+    )
+    group.add_argument(
+        "--harbor-task-route-file",
+        type=str,
+        default=None,
+        help="JSON manifest that pins each task id to a Harbor runner. Required "
+        "when runner-local image shards are used.",
+    )
 
     # --- sampling policy ----------------------------------------------------
     # The run's rollout sampling distribution, pushed to the rollout proxy

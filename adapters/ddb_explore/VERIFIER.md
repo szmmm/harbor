@@ -47,25 +47,27 @@ Only the 4 most recent observations keep their snapshot text in the model
 context, and only the 3 most recent screenshots. Older ones keep their IDs.
 All of them are saved under `evidence/`.
 
-`finish` ends the evaluation when every leaf has a verdict, or at once when a
-critical leaf has FAIL. When the browser budget ends first, the judge gets up
-to two more turns to record verdicts for the remaining leaves.
+`finish` ends the evaluation immediately, with no finalization afterward.
+Critical failures do not stop exploration. When the turn limit ends first,
+the judge gets a forced verdict call and one repair call within the same
+overall deadline.
 
 ## Scoring
 
-`rubric_score.py` follows the generator's reference scorer: gate, then flat
-rate. A failed critical leaf sets the score to 0. Else the score is the pass
-rate, and every leaf has the same weight. Branches only group leaves.
+`rubric_score.py` computes a weighted pass rate: critical leaves have weight 2,
+and non-critical leaves have weight 1. Reward is the total weight of PASS
+leaves divided by the total weight of leaves with PASS or FAIL. A critical
+failure does not force the reward to zero. Branches only group leaves.
 
 UNKNOWN leaves have no verdict. A critical leaf without a verdict makes the
 score unavailable. So does coverage (leaves with PASS or FAIL, divided by all
-leaves) below `VLM_RUBRIC_MIN_COVERAGE` (0.9 by default). Else the pass rate is
-over the leaves with a verdict. With `VLM_RUBRIC_MIN_COVERAGE=1` the score is
-the reference scorer exactly.
+leaves) below `VLM_RUBRIC_MIN_COVERAGE` (0.9 by default). These checks also
+apply when a critical leaf fails. UNKNOWN (called UNTESTED in generated
+tasks) leaves are excluded from the weighted denominator.
 
 `reward.json` has `reward`, the enabled components (`vlm_reward`,
 `trajectory_reward`), and diagnostics that the slime bridge logs but does not
-train on: `vlm_coverage`, `vlm_pass_rate` (without the gate),
+train on: `vlm_coverage`, `vlm_pass_rate` (unweighted),
 `vlm_critical_failed`, and `vlm_branch_<branch>` pass rates.
 
 ## Budget
