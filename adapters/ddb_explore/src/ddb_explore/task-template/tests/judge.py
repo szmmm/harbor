@@ -101,12 +101,19 @@ files in an unverified export are not proof of actor omissions; concrete defects
 in readable files can still establish failure. Prefer current evidence over
 obsolete diagnostics. Assess the submission without repairing or replacing it.
 
-Choose useful checks rather than following a fixed sequence. If repeated recovery
-attempts show the same state, use the other available evidence and conclude;
-retry when there is a concrete reason to expect new information. A usable popup
-or newly rendered app is progress; another starting spinner is not. Leave enough
-time to record your assessment instead of spending the evaluation reopening an
-unavailable preview.
+When the preview is unavailable, make at most three recovery actions in total
+across wait, reload, open_app and return_to_app without meaningful progress.
+If they only reproduce the starting or error page, stop retrying and assess the
+other evidence. A confirmed absent deliverable or concrete app defect can justify
+FAIL for requirements that depend on it; unrelated source-verifiable requirements
+can still PASS. Distinguish these conclusions from checks left UNKNOWN because
+the evidence cannot establish whether the requirement is met. Source that looks
+correct does not turn an unobserved visual or interaction check into PASS, and
+reloading a placeholder is not an interaction with the submitted app. Record the
+supported verdicts and call finish, even if some checks remain UNKNOWN. Revisit
+the preview only if new evidence gives a concrete reason to expect a different
+result, such as an available popup containing the app; another spinner is not
+progress. Choose checks for the information they can add, not a fixed sequence.
 
 Record verdicts with record_verdicts as evidence becomes sufficient. You can
 batch related leaves; a later verdict replaces an earlier one. Before calling
