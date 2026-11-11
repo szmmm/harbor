@@ -59,7 +59,7 @@ overall deadline.
 `rubric_score.py` uses `rubric-tree-v2`: critical leaves have weight 2 and
 other leaves weight 1. Reward is PASS weight divided by the weight of **all**
 rubric leaves. Fully assessed scores are unchanged. Unassessed leaves earn no
-credit but retain UNKNOWN (UNTESTED in generated tasks), rather than being
+credit but retain UNKNOWN, rather than being
 rewritten to FAIL. Coverage, branch pass rates and unresolved critical IDs remain
 diagnostic; partial assessments have `scoring_status: partial`.
 
@@ -218,13 +218,12 @@ readiness and source-transfer diagnostics. The judge-facing build context rename
 only a runtime/session, and `none` means the build was skipped. Neither verifies
 compilation or HTTP readiness. Raw handoff values remain in the audit report.
 Initial readiness errors have unknown attribution, not an infrastructure label.
-The canonical and generated prompts use the same verdict policy (apart from
-UNKNOWN/UNTESTED terminology): proven blockers fail dependent requirements;
+The canonical and generated prompts use the same verdict names and policy: proven blockers fail dependent requirements;
 missing observations or evaluator capabilities remain unassessed. Failed tool
 observations can support FAIL, but do not automatically establish app fault;
 PASS still requires successful observations and actual interaction evidence. It can page through file listings,
 read source in chunks and search. Positive code evidence can support a verdict
-for a failed app, while uncertain omissions remain UNKNOWN/UNTESTED. Source
+for a failed app, while uncertain omissions remain UNKNOWN. Source
 cannot prove visual or interactive success. The prompt uses general evidence
 rules rather than a separate failure workflow or delivery-specific verdict recipes.
 For unavailable previews, a dedicated paragraph limits recovery to three actions
@@ -237,7 +236,7 @@ not an enforced tool budget. When readiness fails, available
 root `package.json` and `.deepdiver/artifact.json` are supplied as cited source
 observations before the first judge call, so nested app manifests do not obscure
 the actual startup configuration. Uncertain infrastructure failures
-may still remain UNKNOWN/UNTESTED. Configured budgets are unchanged; partial scoring follows the v2 rule above.
+may still remain UNKNOWN. Configured budgets are unchanged; partial scoring follows the v2 rule above.
 
 No dependency installation is needed to read source. Harbor retains app source,
 artifact declarations, package manifests, lockfiles, vendored source, assets,
