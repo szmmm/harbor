@@ -44,8 +44,10 @@ import logging
 import os
 import re
 import socket
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
@@ -94,8 +96,37 @@ def build_app(
     runner_id: str = "local",
     profile_id: str = "ddb",
     auth_token: str | None = None,
+    manage_callback: bool = False,
 ) -> FastAPI:
-    app = FastAPI(title="harbor.slime_bridge rollout service")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if not manage_callback:
+            yield
+            return
+        # Hold one reference for the service lifetime. Trials share this exact
+        # listener, so callback conflicts fail startup instead of the first batch.
+        from harbor.agents.installed.ddb import (
+            DEFAULT_CALLBACK_PORT,
+            _acquire_listener,
+            _default_callback_secret,
+            _release_listener,
+        )
+
+        listener = await _acquire_listener(
+            bind_host=os.getenv("DDB_CALLBACK_HOST") or "0.0.0.0",
+            bind_port=int(os.getenv("DDB_CALLBACK_PORT") or DEFAULT_CALLBACK_PORT),
+            advertised_url=os.getenv("DDB_CALLBACK_URL") or None,
+            secret=os.getenv("DDB_CALLBACK_SECRET") or _default_callback_secret(),
+            probe_host=urlsplit(os.getenv("DDB_BASE_URL", "")).hostname or "127.0.0.1",
+        )
+        app.state.callback_listener = listener
+        try:
+            yield
+        finally:
+            app.state.callback_listener = None
+            await _release_listener()
+
+    app = FastAPI(title="harbor.slime_bridge rollout service", lifespan=lifespan)
     lock = asyncio.Lock()
 
     @app.get("/health")
@@ -108,6 +139,25 @@ def build_app(
             "model_name": client.config.model_name,
             "runner_id": runner_id,
             "profile_id": profile_id,
+        }
+
+    @app.get("/ready")
+    async def ready() -> dict[str, Any]:
+        listener = getattr(app.state, "callback_listener", None)
+        if (
+            listener is None
+            or listener._server is None
+            or not listener._server.is_serving()
+        ):
+            raise HTTPException(
+                status_code=503, detail="callback listener is not ready"
+            )
+        return {
+            **await health(),
+            "status": "ready",
+            "pid": os.getpid(),
+            "jobs_dir": str(client.config.jobs_dir),
+            "callback_url": listener.advertised_url,
         }
 
     @app.post("/rollout")
@@ -203,10 +253,12 @@ def main() -> None:
             runner_id=args.runner_id,
             profile_id=args.profile_id,
             auth_token=auth_token,
+            manage_callback=True,
         ),
         host=args.host,
         port=args.port,
         timeout_keep_alive=3600,
+        timeout_graceful_shutdown=20,
     )
 
 
