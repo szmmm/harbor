@@ -130,7 +130,11 @@ def wait_for_app_ready(url: str, timeout: float) -> str | None:
 
 
 async def run_probe(
-    app_url: str, app_spec: dict[str, Any], rubric: dict[str, Any]
+    app_url: str,
+    app_spec: dict[str, Any],
+    rubric: dict[str, Any],
+    *,
+    preview_error: str | None = None,
 ) -> dict[str, Any]:
     """Judge every leaf of the task's rubric tree on the running app."""
     model = os.environ.get("VLM_MODEL", "Qwen/Qwen2.5-VL-32B-Instruct").strip()
@@ -170,7 +174,7 @@ async def run_probe(
                 deadline_s=deadline_s,
                 source_root=APP_DIR,
                 trace_sink=sink,
-            ).evaluate(app_url, rubric, device=device)
+            ).evaluate(app_url, rubric, device=device, preview_error=preview_error)
         finally:
             await env.stop()
     finally:
@@ -238,24 +242,10 @@ def main() -> int:
         if app_url
         else "APP_BASE_URL is not set; a remote preview URL is required"
     )
-    # Local verification helpers remain available, but routing is disabled for now.
-    if preview_error is not None:
-        _write_report(
-            {
-                "status": "app_unavailable",
-                "scoring": "disabled",
-                "score": None,
-                "error": preview_error,
-                "execution_source": "remote_preview",
-                "preview_readiness_error": preview_error,
-                "findings": [],
-            }
-        )
-        print("=== Preview unavailable; local fallback is disabled ===", flush=True)
-        return 1
-
     try:
-        report = asyncio.run(run_probe(app_url, app_spec, rubric))
+        report = asyncio.run(
+            run_probe(app_url, app_spec, rubric, preview_error=preview_error)
+        )
     except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
         report = {
             "status": "evaluator_failed",
@@ -269,7 +259,7 @@ def main() -> int:
             "trace_path": str(TRACE_PATH),
         }
     report["execution_source"] = "remote_preview"
-    report["preview_readiness_error"] = None
+    report.setdefault("preview_readiness_error", preview_error)
     _write_report(report)
     status = str(report.get("status") or "evaluator_failed")
     print(f"=== Exploratory probe report: {REPORT_PATH} ({status}) ===")

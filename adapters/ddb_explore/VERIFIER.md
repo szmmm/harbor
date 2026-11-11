@@ -168,7 +168,13 @@ cannot complete within the shared deadline, or the scorer cannot produce a
 usable score, the evaluation fails with no reward. Evidence and recorded
 verdicts remain available for diagnosis.
 
-The verifier requires `APP_BASE_URL`. If the preview fails its readiness check
-(within `APP_READY_TIMEOUT`, default 120 seconds), verification exits with
-`app_unavailable`, disabled scoring, and no local workspace fallback. A missing
-preview URL fails immediately.
+The preview readiness check remains bounded by `APP_READY_TIMEOUT` (default
+120 seconds). A failed check or missing `APP_BASE_URL` is passed to the existing
+rubric judge as `preview_readiness_error`, together with a not-ready note. The
+judge retains the same rubric, browser/source tools, budgets and scoring rules.
+Initial navigation failures and subsequent failed browser retries are saved as
+failed observations, so the judge can inspect sources or retry the preview.
+There is no separate judge, automatic zero, or local workspace startup fallback.
+A normal evidence-supported zero remains a valid reward; unresolved critical
+checks or judge failures still produce no reward. Rollout-only runs with the
+verifier disabled remain unaffected.

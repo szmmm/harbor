@@ -18,6 +18,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -297,6 +298,7 @@ class RubricJudge(ProbeAgent):
         self.model_turns = 0
         self.request_retries = 0
         self._observations: list[dict] = []
+        self.preview_error: str | None = None
 
     async def _observe(self, action: str, args: dict, outcome: dict) -> list[dict]:
         snap = await self._inspector.interactive_snapshot(self._snapshot_args())
@@ -648,20 +650,34 @@ class RubricJudge(ProbeAgent):
                     observations.extend(self._observe_source(name, args, outcome))
                     reply = f"Done. See observation {self.evidence[-1]['id']}."
                 elif name in BROWSER_NAMES:
-                    if name == "take_screenshot":
-                        outcome = {"success": True}
-                    elif name in {
-                        "set_viewport",
-                        "set_media",
-                        "clear_site_data",
-                        "return_to_app",
-                        "click_at",
-                        "open_app",
-                    }:
-                        outcome = await self._page_tool(name, args)
-                    else:
-                        outcome = await self._dispatch(name, args)
-                    observations.extend(await self._observe(name, args, outcome))
+                    try:
+                        if name == "take_screenshot":
+                            outcome = {"success": True}
+                        elif name in {
+                            "set_viewport",
+                            "set_media",
+                            "clear_site_data",
+                            "return_to_app",
+                            "click_at",
+                            "open_app",
+                        }:
+                            outcome = await self._page_tool(name, args)
+                        else:
+                            outcome = await self._dispatch(name, args)
+                        observations.extend(await self._observe(name, args, outcome))
+                    except Exception as exc:
+                        if self.preview_error is None:
+                            raise
+                        observations.extend(
+                            self._observe_source(
+                                name,
+                                args,
+                                {
+                                    "success": False,
+                                    "error": _safe_preview_error(exc),
+                                },
+                            )
+                        )
                     reply = f"Done. See observation {self.evidence[-1]['id']}."
                 else:
                     raise ValueError(f"unknown tool {name!r}")
@@ -685,11 +701,13 @@ class RubricJudge(ProbeAgent):
         rubric: dict[str, Any],
         *,
         device=None,
+        preview_error: str | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         self._deadline_at = started + self.deadline_s
         self._finalizing = False
         self._app_url = app_url
+        self.preview_error = preview_error
         leaves = flatten(rubric["tree"])
         by_id = {leaf["id"]: leaf for leaf in leaves}
         spec = rubric.get("spec") or {}
@@ -713,6 +731,15 @@ class RubricJudge(ProbeAgent):
             ],
         }
         task_json = json.dumps(task, ensure_ascii=False)
+        if preview_error is not None:
+            task["preview_readiness_error"] = preview_error
+            task["preview_readiness_note"] = (
+                "The preview was not ready at the initial check. Continue the same "
+                "evaluation using the available browser and source tools. You may "
+                "retry the preview. This error alone is not evidence of a failed "
+                "requirement; use the normal evidence and scoring rules."
+            )
+            task_json = json.dumps(task, ensure_ascii=False)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": task_json + "\n" + _device_block(device)},
@@ -722,10 +749,26 @@ class RubricJudge(ProbeAgent):
         result: dict[str, Any]
         try:
             self._env.reset_runtime_log()
-            await self._env.goto(app_url)
+            try:
+                if not app_url:
+                    raise ValueError("No preview URL was published")
+                await self._env.goto(app_url)
+                initial = await self._observe("open", {}, {"success": True})
+            except Exception as exc:  # noqa: BLE001 - a navigation failure must still reach the judge
+                self.preview_error = self.preview_error or _safe_preview_error(exc)
+                initial = self._observe_source(
+                    "open",
+                    {},
+                    {
+                        "success": False,
+                        "error": _safe_preview_error(exc),
+                        "preview_readiness_error": self.preview_error,
+                        "note": "Preview not ready. Continue with source inspection or retry the browser; normal evidence and scoring rules still apply.",
+                    },
+                )
             first = {
                 "role": "user",
-                "content": await self._observe("open", {}, {"success": True}),
+                "content": initial,
             }
             messages.append(first)
             self._observations.append(first)
@@ -812,6 +855,7 @@ class RubricJudge(ProbeAgent):
             client.close()
         result.update(
             scoring=SCORING,
+            preview_readiness_error=self.preview_error,
             rubric_id=rubric.get("id"),
             rubric_hash=hashlib.sha256(task_json.encode()).hexdigest(),
             summary=self.summary,
@@ -842,3 +886,10 @@ class RubricJudge(ProbeAgent):
             {"kind": "evaluation", **{k: v for k, v in result.items() if k != "leaves"}}
         )
         return result
+
+
+def _safe_preview_error(exc: Exception) -> str:
+    """Retain a useful browser failure without leaking preview URL tokens."""
+    return re.sub(
+        r"https?://[^\s<>\"']+", "<URL redacted>", f"{type(exc).__name__}: {exc}"
+    )[:1000]
