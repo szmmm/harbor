@@ -108,46 +108,39 @@ def test_trace_retains_new_observations_when_old_table_is_removed(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "preview_url,readiness_error",
-    [
-        ("https://preview.example.test", "Preview readiness timed out"),
-        ("", None),
-        ("https://preview.example.test", None),
-    ],
+    "url,readiness_error",
+    [("http://preview", "HTTP 202: not ready"), ("", None), ("http://preview", None)],
 )
-def test_preview_required_without_local_fallback(
-    tmp_path, monkeypatch, preview_url, readiness_error
+def test_readiness_reaches_normal_probe_without_local_fallback(
+    tmp_path, monkeypatch, url, readiness_error
 ):
-    from unittest.mock import AsyncMock, Mock
     import test_explore as explore
-    import local_app
 
+    monkeypatch.setenv("VLM_API_KEY", "test")
+    monkeypatch.setenv("APP_BASE_URL", url)
     monkeypatch.setenv("VLM_EXPLORE_ENABLED", "1")
-    monkeypatch.setenv("VLM_API_KEY", "test-key")
-    monkeypatch.setenv("APP_BASE_URL", preview_url)
-    for name in ("APP_SPEC_PATH", "RUBRIC_PATH"):
-        path = tmp_path / name
-        path.write_text("{}")
-        monkeypatch.setattr(explore, name, path)
-    report_path = tmp_path / "report.json"
-    monkeypatch.setattr(explore, "REPORT_PATH", report_path)
-    ready = Mock(return_value=readiness_error)
-    probe = AsyncMock(return_value={"status": "completed", "score": 1.0})
-    local = Mock(side_effect=AssertionError("Local fallback must not run"))
-    monkeypatch.setattr(explore, "wait_for_app_ready", ready)
-    monkeypatch.setattr(explore, "run_probe", probe)
-    monkeypatch.setattr(local_app, "start_local_app", local)
-    monkeypatch.setattr(explore, "start_dev_server", local)
-    success = bool(preview_url) and readiness_error is None
-    assert explore.main() == (0 if success else 1)
-    report = json.loads(report_path.read_text())
-    assert report["status"] == ("completed" if success else "app_unavailable")
-    assert report["execution_source"] == "remote_preview"
-    local.assert_not_called()
-    if success:
-        probe.assert_awaited_once()
-    else:
-        probe.assert_not_awaited()
-        assert report["score"] is None
-    if not preview_url:
-        ready.assert_not_called()
+    spec = tmp_path / "app_spec.json"
+    rubric = tmp_path / "rubric.json"
+    spec.write_text('{"default_device":"desktop"}')
+    rubric.write_text('{"prompt":"Build an app"}')
+    monkeypatch.setattr(explore, "APP_SPEC_PATH", spec)
+    monkeypatch.setattr(explore, "RUBRIC_PATH", rubric)
+    monkeypatch.setattr(explore, "REPORT_PATH", tmp_path / "report.json")
+    monkeypatch.setattr(explore, "wait_for_app_ready", lambda *args: readiness_error)
+    monkeypatch.setattr(
+        explore, "start_dev_server", lambda: pytest.fail("Local fallback must not run")
+    )
+    calls = []
+
+    async def run_probe(app_url, app_spec, rubric, *, preview_error=None, handoff=None):
+        calls.append((app_url, preview_error))
+        return {"status": "completed", "score": 0}
+
+    monkeypatch.setattr(explore, "run_probe", run_probe)
+    assert explore.main() == 0
+    assert len(calls) == 1 and calls[0][0] == url
+    assert bool(calls[0][1]) is bool(not url or readiness_error)
+    assert (
+        json.loads(explore.REPORT_PATH.read_text())["preview_readiness_error"]
+        == calls[0][1]
+    )

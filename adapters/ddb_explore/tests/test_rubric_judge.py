@@ -9,7 +9,7 @@ import combine_rewards
 import pytest
 from judge import FINAL_TURNS, RubricJudge, check_verdict
 from probe import ProbeConfig
-from rubric_score import flatten, score_tree
+from rubric_score import flatten
 
 
 def leaf(leaf_id, description, *, critical=False, verify_by="view", note=""):
@@ -131,37 +131,6 @@ def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
     assert len(client.requests) == 3 and result["request_retries"] == 2
 
 
-def test_score_weights_critical_leaves_twice():
-    result = score_tree(LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"})
-    assert result["status"] == "completed"
-    assert result["score"] == pytest.approx(5 / 6)
-    assert result["pass_rate"] == pytest.approx(4 / 5)
-    assert result["branches"]["static"] == pytest.approx(0.5)
-    assert result["branches"]["content"] is None
-
-
-def test_failed_critical_leaf_scores_at_low_coverage():
-    result = score_tree(LEAVES, {"I.1": "FAIL"})
-    assert (result["status"], result["score"], result["failed_critical"]) == (
-        "completed",
-        0.0,
-        ["I.1"],
-    )
-
-
-def test_unknown_critical_leaf_has_no_score():
-    verdicts = {i: "PASS" for i in IDS} | {"I.1": "UNKNOWN"}
-    result = score_tree(LEAVES, verdicts)
-    assert result["status"] == "incomplete" and result["score"] is None
-
-
-def test_low_coverage_scores_resolved_leaves():
-    verdicts = {"I.1": "PASS", "S.1.1": "PASS", "S.1.2": "FAIL", "D.B.1": "PASS"}
-    result = score_tree(LEAVES, verdicts)
-    assert result["score"] == pytest.approx(4 / 5)
-    assert result["counts"] == {"PASS": 3, "FAIL": 1, "UNKNOWN": 1}
-
-
 @pytest.mark.skipif(
     not Path(os.environ.get("RUBRICS_JSONL", "/nonexistent")).is_file(),
     reason="set RUBRICS_JSONL to check real trees",
@@ -278,6 +247,17 @@ def test_check_verdict_accepts():
         BY_ID,
         EVIDENCE,
     )
+    failed_observation = check_verdict(
+        {
+            "leaf_id": "I.1",
+            "verdict": "FAIL",
+            "reason": "The attempted action exposed a blocking application error.",
+            "evidence_ids": ["e0002"],
+        },
+        BY_ID,
+        EVIDENCE,
+    )
+    assert failed_observation["verdict"] == "FAIL"
 
 
 def test_source_tree_reads_inside_root_only(tmp_path):
@@ -473,7 +453,7 @@ def test_page_and_source_tools_record_evidence(tmp_path):
         ],
         [("finish", {"summary": "done"})],
     ]
-    result, client = run_judge(tmp_path, script)
+    result, _ = run_judge(tmp_path, script)
     actions = [row["action"] for row in result["evidence"]]
     assert actions == [
         "open",
@@ -485,9 +465,9 @@ def test_page_and_source_tools_record_evidence(tmp_path):
     assert result["evidence"][3]["screenshot"] is None
     # D.B.1 is an interaction leaf: a PASS citing only the landing page is rejected.
     assert result["leaves"][3]["verdict"] == "UNKNOWN"
-    assert result["status"] == "evaluator_failed" and result[
-        "coverage"
-    ] == pytest.approx(4 / 5)
+    assert result["status"] == "completed"
+    assert result["coverage"] == pytest.approx(4 / 5)
+    assert result["score"] == pytest.approx(4 / 6)
     source = json.loads((tmp_path / "evidence/e0003.json").read_text())
     assert "index.html:1:" in source["outcome"]["text"]
 
@@ -516,7 +496,10 @@ def test_judge_loop_scores_recorded_verdicts(tmp_path):
     ]
     result, client = run_judge(tmp_path, script)
     assert result["status"] == "completed", result
-    assert result["score"] == pytest.approx(4 / 5)
+    assert result["score"] == pytest.approx(5 / 6)
+    assert result["pass_rate"] == pytest.approx(4 / 5)
+    assert result["branches"]["static"] == pytest.approx(0.5)
+    assert result["branches"]["content"] is None
     assert result["finished_by_model"] and result["summary"] == "食材应用"
     assert [row["verdict"] for row in result["leaves"]] == [
         "PASS",
@@ -550,7 +533,7 @@ def test_judge_forces_verdicts_when_budget_ends(tmp_path):
     assert final["tool_choice"]["function"]["name"] == "record_verdicts"
     assert [t["function"]["name"] for t in final["tools"]] == ["record_verdicts"]
     assert len(client.requests) == 3
-    assert result["status"] == "completed" and result["score"] == 1.0
+    assert result["status"] == "completed" and result["score"] == pytest.approx(5 / 6)
     assert not result["finished_by_model"]
 
 
@@ -562,7 +545,7 @@ def test_judge_without_verdicts_has_no_score(tmp_path):
 
 def test_old_observations_keep_text_and_limit_images(tmp_path):
     script = [[("take_screenshot", {})] for _ in range(7)]
-    result, client = run_judge(tmp_path, script, max_steps=7)
+    _, client = run_judge(tmp_path, script, max_steps=7)
     texts = [
         json.loads(item["text"])
         for m in client.requests[-1]["messages"]
@@ -806,7 +789,7 @@ def test_critical_fail_does_not_stop_exploration(tmp_path):
         ],
         max_steps=2,
     )
-    assert result["score"] is None and result["status"] == "evaluator_failed"
+    assert result["score"] == 0 and result["status"] == "completed"
     assert len(result["evidence"]) == 2 and len(client.requests) == 3
 
 
@@ -875,5 +858,328 @@ def test_finish_skips_later_calls_in_same_response(tmp_path):
             ]
         ],
     )
-    assert result["score"] is None and result["finished_by_model"]
+    assert result["score"] == 0 and result["finished_by_model"]
     assert len(client.requests) == 1 and len(result["evidence"]) == 1
+
+
+WEIGHT_LEAVES = [
+    {"id": "critical", "critical": True, "branch": "intention"},
+    {"id": "ordinary1", "critical": False, "branch": "static"},
+    {"id": "ordinary2", "critical": False, "branch": "static"},
+]
+
+
+@pytest.fixture
+def scorer():
+    import rubric_score
+
+    return rubric_score
+
+
+@pytest.mark.parametrize(
+    "verdicts, expected",
+    [
+        (["PASS", "PASS", "PASS"], 1),
+        (["FAIL", "PASS", "PASS"], 0.5),
+        (["PASS", "FAIL", "PASS"], 0.75),
+    ],
+)
+def test_critical_weight_and_failure(scorer, verdicts, expected):
+    values = dict(zip([leaf["id"] for leaf in WEIGHT_LEAVES], verdicts))
+    result = scorer.score_tree(WEIGHT_LEAVES, values)
+    assert result["status"] == "completed"
+    assert result["score"] == pytest.approx(expected)
+    assert result["pass_rate"] == pytest.approx(verdicts.count("PASS") / 3)
+    assert result["failed_critical"] == (["critical"] if verdicts[0] == "FAIL" else [])
+
+
+def test_critical_failure_scores_at_low_coverage(scorer):
+    result = scorer.score_tree(WEIGHT_LEAVES, {"critical": "FAIL"})
+    assert result["status"] == "completed" and result["score"] == 0
+    assert result["coverage"] == pytest.approx(1 / 3)
+
+
+def test_critical_pass_scores_at_low_coverage(scorer):
+    result = scorer.score_tree(WEIGHT_LEAVES, {"critical": "PASS"})
+    assert result["status"] == "completed" and result["score"] == 0.5
+    assert result["coverage"] == pytest.approx(1 / 3)
+
+
+def test_unknown_earns_no_credit_without_becoming_fail(scorer):
+    values = {"critical": "FAIL", "ordinary1": "PASS"}
+    result = scorer.score_tree(WEIGHT_LEAVES, values)
+    assert result["score"] == pytest.approx(1 / 4)
+    assert result["counts"] == {"PASS": 1, "FAIL": 1, "UNKNOWN": 1}
+
+
+@pytest.mark.parametrize("critical", [None, "UNKNOWN"])
+def test_missing_critical_preserves_partial_reward(scorer, critical):
+    values = {"ordinary1": "PASS"}
+    if critical is not None:
+        values["critical"] = critical
+    result = scorer.score_tree(WEIGHT_LEAVES, values)
+    assert result["status"] == "completed" and result["score"] == 0.25
+    assert result["scoring_status"] == "partial"
+    assert result["unresolved_critical"] == ["critical"]
+
+
+def test_failed_critical_does_not_hide_an_unresolved_critical(scorer):
+    leaves = WEIGHT_LEAVES + [{"id": "missing", "critical": True, "branch": "dynamic"}]
+    result = scorer.score_tree(leaves, {"critical": "FAIL"})
+    assert result["status"] == "completed" and result["score"] == 0
+    assert result["unresolved_critical"] == ["missing"]
+
+
+def test_weighted_reward_reaches_training(scorer, monkeypatch):
+    monkeypatch.setenv("VLM_REWARD_ENABLED", "1")
+    monkeypatch.setenv("TRAJECTORY_REWARD_ENABLED", "0")
+    result = scorer.score_tree(
+        WEIGHT_LEAVES,
+        {"critical": "UNKNOWN", "ordinary1": "FAIL"},
+    )
+    combine = combine_rewards
+    rewards = combine.build_rewards(result, {"status": "disabled"})
+    assert rewards["reward"] == rewards["vlm_reward"] == 0
+    assert rewards["vlm_critical_failed"] == 0
+
+
+def _preview_judge(tmp_path, script, *, failing_browser=True):
+    class Env(FakeEnv):
+        async def goto(self, url):
+            if failing_browser:
+                raise RuntimeError(
+                    "Navigation timeout at https://preview.test/?token=SECRET"
+                )
+            await super().goto(url)
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "README.md").write_text("No application was implemented.")
+    judge = RubricJudge(
+        Env(),
+        ProbeConfig(model="m", api_key="k", max_steps=6),
+        tmp_path / "evidence",
+        deadline_s=60,
+        source_root=root,
+        executor=FakeExecutor(),
+        inspector=FakeInspector(),
+    )
+    client = FakeClient(script)
+    judge._make_client = lambda: client
+    return judge, client
+
+
+def test_unavailable_preview_can_be_judged_zero_from_source(tmp_path, monkeypatch):
+    script = [
+        [
+            (
+                "record_verdicts",
+                {"verdicts": [verdict(i, "FAIL", "e0002") for i in IDS]},
+            )
+        ],
+        [("finish", {"summary": "Required app was not implemented."})],
+    ]
+    judge, client = _preview_judge(tmp_path, script)
+    (judge.source.root / "package.json").write_text(
+        json.dumps({"scripts": {"dev": "vite"}})
+    )
+    handoff = {"build": {"mode": "live", "success": True, "error": ""}}
+    result = asyncio.run(
+        judge.evaluate(
+            "http://app", RUBRIC, preview_error="HTTP 202: not ready", handoff=handoff
+        )
+    )
+    assert result["status"] == "completed" and result["score"] == 0
+    assert result["model_turns"] == 2
+    first_request = json.dumps(client.requests[0]["messages"])
+    assert "package.json" in first_request and "vite" in first_request
+    assert judge.evidence[2]["input"] == {"path": "package.json"}
+    build_context = judge.evidence[1]["outcome"]["build"]
+    assert "success" not in build_context
+    assert build_context["platform_reported_success"] is True
+    assert (
+        "not a compilation result or an HTTP readiness check"
+        in build_context["meaning"]
+    )
+    assert handoff["build"] == {"mode": "live", "success": True, "error": ""}
+    assert result["handoff"] == handoff
+    assert result["preview_readiness_error"] == "HTTP 202: not ready"
+    names = {t["function"]["name"] for t in client.requests[0]["tools"]}
+    assert {"read_source_file", "return_to_app", "record_verdicts", "finish"} <= names
+    assert "HTTP 202: not ready" in json.dumps(client.requests[0]["messages"])
+    assert "SECRET" not in json.dumps(judge.evidence)
+    monkeypatch.setenv("VLM_REWARD_ENABLED", "1")
+    monkeypatch.setenv("TRAJECTORY_REWARD_ENABLED", "0")
+    assert combine_rewards.build_rewards(result, {})["reward"] == 0
+
+
+def test_navigation_failure_and_retry_do_not_abort_judge(tmp_path):
+    judge, client = _preview_judge(
+        tmp_path,
+        [
+            [("return_to_app", {})],
+            [("list_source_files", {})],
+            [("finish", {"summary": "Insufficient evidence to blame the app."})],
+        ],
+    )
+    result = asyncio.run(judge.evaluate("http://app", RUBRIC, preview_error=None))
+    assert len(client.requests) == 3
+    assert result["status"] == "evaluator_failed" and result["score"] is None
+    assert [e["action"] for e in judge.evidence] == [
+        "open",
+        "return_to_app",
+        "list_source_files",
+    ]
+    assert [e["success"] for e in judge.evidence] == [False, False, True]
+
+
+def test_recovered_preview_keeps_normal_scoring(tmp_path):
+    judge, client = _preview_judge(
+        tmp_path,
+        [
+            [("click_ref", {"ref": 0})],
+            [
+                (
+                    "record_verdicts",
+                    {"verdicts": [verdict(i, "PASS", "e0001") for i in IDS]},
+                )
+            ],
+            [("finish", {"summary": "Preview recovered; all requirements checked."})],
+        ],
+        failing_browser=False,
+    )
+    result = asyncio.run(
+        judge.evaluate("http://app", RUBRIC, preview_error="Earlier timeout")
+    )
+    assert result["score"] == 1 and result["status"] == "completed"
+    assert len(client.requests) == 3
+
+
+def test_upload_integrity_alone_does_not_certify_missing_actor_files(tmp_path):
+    judge, _ = _preview_judge(
+        tmp_path,
+        [
+            [("read_source_file", {"path": "hidden-entry.html"})],
+            [("finish", {"summary": "The API may have omitted this file."})],
+        ],
+    )
+    handoff = {
+        "source_transfer": {
+            "sandbox_hashes_verified": True,
+            "inventory_complete": False,
+        }
+    }
+    asyncio.run(
+        judge.evaluate(
+            "http://app", RUBRIC, preview_error="Unavailable", handoff=handoff
+        )
+    )
+    assert judge.evidence[1]["success"] is False
+    assert judge.source.verified_complete is False
+
+
+class _TabPage:
+    def __init__(self, context, title):
+        self.context, self.name = context, title
+        self.url = "https://user:secret@app.test/deck?token=SECRET#PRIVATE"
+        self.closed, self.focused = False, False
+        self.events = {}
+        context.pages.append(self)
+
+    def set_default_timeout(self, value):
+        self.timeout = value
+
+    def on(self, event, callback):
+        self.events.setdefault(event, []).append(callback)
+
+    def is_closed(self):
+        return self.closed
+
+    async def title(self):
+        return self.name
+
+    async def bring_to_front(self):
+        self.focused = True
+
+    def close(self):
+        self.closed = True
+        self.context.pages.remove(self)
+        for callback in self.events.get("close", []):
+            callback()
+
+
+def test_popup_selection_rejects_closed_and_previous_profile_tabs():
+    from browser_env.playwright_env import PlaywrightEnv
+
+    env = PlaywrightEnv()
+    env._context = context = SimpleNamespace(pages=[])
+    env._page = original = _TabPage(context, "Files")
+    original_id = env._register_page(original)
+    popup = _TabPage(context, "Slideshow")
+    popup_id = env._register_page(popup)  # context page event precedes popup event
+    original.events["popup"][0](popup)
+    assert env.page is original
+    assert len(popup.events["console"]) == 1
+    assert env.drain_side_effects()[0]["tab_id"] == popup_id
+    tabs = asyncio.run(env.list_tabs())
+    assert [tab["tab_id"] for tab in tabs] == [original_id, popup_id]
+    assert [tab["active"] for tab in tabs] == [True, False]
+    assert all(tab["url"] == "https://app.test/deck" for tab in tabs)
+    asyncio.run(env.switch_tab(popup_id))
+    assert env.page is popup and popup.focused
+    asyncio.run(env.switch_tab(original_id))
+    assert env.page is original
+    popup.close()
+    with pytest.raises(ValueError, match="Unknown or closed"):
+        asyncio.run(env.switch_tab(popup_id))
+    env._context = SimpleNamespace(pages=[])
+    with pytest.raises(ValueError, match="Unknown or closed"):
+        asyncio.run(env.switch_tab(original_id))
+    assert asyncio.run(env.list_tabs()) == []
+
+
+def test_judge_dispatch_exposes_tabs_and_refreshes_references(tmp_path, monkeypatch):
+    calls = []
+
+    async def list_tabs(self):
+        return [{"tab_id": "tab-2", "title": "Slideshow", "active": False}]
+
+    async def switch_tab(self, tab_id):
+        calls.append(tab_id)
+
+    async def snapshot(self, args):
+        name = "下一页" if calls else "Open"
+        return {
+            "success": True,
+            "text": f"[0] button '{name}'",
+            "data": {"nodes": [{"name": name, "role": "button", "x": 5, "y": 5}]},
+        }
+
+    monkeypatch.setattr(FakeEnv, "list_tabs", list_tabs, raising=False)
+    monkeypatch.setattr(FakeEnv, "switch_tab", switch_tab, raising=False)
+    monkeypatch.setattr(FakeInspector, "interactive_snapshot", snapshot)
+    result, client = run_judge(
+        tmp_path,
+        [
+            [("list_tabs", {})],
+            [("switch_tab", {"tab_id": "tab-2"})],
+            [("finish", {"summary": "switched"})],
+        ],
+    )
+    assert calls == ["tab-2"]
+    assert [e["action"] for e in result["evidence"]] == [
+        "open",
+        "list_tabs",
+        "switch_tab",
+    ]
+    names = {t["function"]["name"] for t in client.requests[0]["tools"]}
+    assert {"list_tabs", "switch_tab"} <= names
+    observation = json.loads((tmp_path / "evidence/e0002.json").read_text())
+    assert observation["snapshot"]["data"]["nodes"][0]["name"] == "下一页"
+    assert observation["outcome"]["tab_id"] == "tab-2"
+    with pytest.raises(ValueError, match="after an action"):
+        check_verdict(
+            verdict("I.1", "PASS", "e1"),
+            BY_ID,
+            {"e1": {"action": "switch_tab", "success": True}},
+        )

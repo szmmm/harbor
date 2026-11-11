@@ -4,10 +4,10 @@ The score is the weighted pass rate: critical leaves have weight 2 and other
 leaves have weight 1. A critical failure does not force the score to zero.
 Branches only group leaves; diagnostic pass rates remain unweighted.
 
-The judge can leave a leaf UNKNOWN when it could not reach the check. Such a
-leaf has no verdict. A critical leaf without a verdict makes the score
-unavailable. Coverage is diagnostic only; the weighted pass rate uses leaves
-with a verdict.
+A completed judge assessment with at least one PASS/FAIL receives a score.
+Unassessed leaves retain their diagnostic verdict and earn no credit: the
+weighted denominator includes every rubric leaf. An unresolved critical check
+does not suppress the reward. No usable verdicts still means no score.
 """
 
 from __future__ import annotations
@@ -71,14 +71,10 @@ def score_tree(
     ]
     coverage = len(resolved) / len(leaves)
     n_pass = sum(resolved.values())
-    resolved_weights = {
-        leaf["id"]: 2 if leaf["critical"] else 1
-        for leaf in leaves
-        if leaf["id"] in resolved
-    }
-    total_weight = sum(resolved_weights.values())
+    weights = {leaf["id"]: 2 if leaf["critical"] else 1 for leaf in leaves}
+    total_weight = sum(weights.values())
     passed_weight = sum(
-        weight for leaf_id, weight in resolved_weights.items() if resolved[leaf_id]
+        weight for leaf_id, weight in weights.items() if resolved.get(leaf_id) is True
     )
     branches = {}
     for branch in BRANCHES:
@@ -101,15 +97,16 @@ def score_tree(
             for verdict in VERDICTS
         },
     }
-    if unresolved_critical:
+    if not resolved:
         return {
             **result,
             "status": "incomplete",
             "score": None,
-            "error": f"Critical leaves without a verdict: {unresolved_critical}",
+            "error": "No PASS or FAIL verdicts were recorded",
         }
     return {
         **result,
         "status": "completed",
         "score": passed_weight / total_weight if total_weight else None,
+        "scoring_status": "complete" if len(resolved) == len(leaves) else "partial",
     }

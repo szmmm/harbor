@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import Error as PlaywrightError
 
 from . import net_trace
 from .devices import DEFAULT_DEVICE, Device
@@ -145,6 +146,8 @@ class PlaywrightEnv:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._tabs: dict[str, Page] = {}
+        self._next_tab_id = 1
 
         # False for a session that borrows another env's Browser (see
         # ``spawn_isolated_session`` in the eval subclass): it owns only its
@@ -266,6 +269,7 @@ class PlaywrightEnv:
                 "same-origin preview requests only"
             )
         await context.route("**/*", self._route_request)
+        context.on("page", self._register_page)
         await self._on_context_created(context)
         return context
 
@@ -279,10 +283,56 @@ class PlaywrightEnv:
     async def _new_configured_page(self, context: BrowserContext) -> Page:
         """Open a page in ``context`` with the standard timeout + listeners."""
         page = await context.new_page()
+        self._register_page(page)
+        return page
+
+    def _register_page(self, page: Page) -> str:
+        """Configure every page, including popups, exactly once without focusing it."""
+        for tab_id, existing in self._tabs.items():
+            if existing is page:
+                return tab_id
+        tab_id = f"tab-{self._next_tab_id}"
+        self._next_tab_id += 1
+        self._tabs[tab_id] = page
         page.set_default_timeout(30_000)
         self._attach_runtime_listeners(page)
         self._on_page_created(page)
-        return page
+        page.on("close", lambda: self._tabs.pop(tab_id, None))
+        return tab_id
+
+    async def list_tabs(self) -> list[dict[str, Any]]:
+        """List live tabs in this profile; omit URL credentials, query and fragment."""
+        if self._context is None:
+            raise RuntimeError("Browser not started")
+        tabs = []
+        for page in self._context.pages:
+            if page.is_closed():
+                continue
+            tab_id = self._register_page(page)
+            try:
+                title = await asyncio.wait_for(page.title(), timeout=1.0)
+            except (PlaywrightError, TimeoutError):
+                title = ""
+            parsed = urlparse(page.url)
+            tabs.append({
+                "tab_id": tab_id,
+                "active": page is self._page,
+                "title": _truncate(title, 200),
+                "url": _truncate(parsed._replace(
+                    netloc=parsed.netloc.rsplit("@", 1)[-1], query="", fragment=""
+                ).geturl(), 300),
+            })
+        return tabs
+
+    async def switch_tab(self, tab_id: str) -> None:
+        """Select an existing live tab without navigation or storage changes."""
+        page = self._tabs.get(tab_id)
+        if (page is None or page.is_closed() or self._context is None
+                or page.context is not self._context):
+            raise ValueError(f"Unknown or closed tab {tab_id!r}; call list_tabs")
+        await page.bring_to_front()
+        self._page = page
+        self._last_cursor_xy = (0, 0)
 
     def _on_page_created(self, page: Page) -> None:
         """Hook: attach extra listeners to every page this env opens."""
@@ -315,6 +365,7 @@ class PlaywrightEnv:
         self._context = None
         self._browser = None
         self._playwright = None
+        self._tabs.clear()
 
     async def _route_request(self, route: Any) -> None:
         """Context-wide request hook: font cache first, then preview header."""
@@ -1119,7 +1170,8 @@ class PlaywrightEnv:
             # unchanged. Record it; do NOT switch the active page, or the probe
             # would silently continue against a tab it never chose.
             self._note_side_effect(
-                "popup", url=_truncate(str(getattr(popup, "url", "") or ""), 300))
+                "popup", tab_id=self._register_page(popup),
+                url=_truncate(str(getattr(popup, "url", "") or ""), 300))
 
         try:
             page.on("console", _on_console)

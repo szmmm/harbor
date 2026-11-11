@@ -17,6 +17,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from browser_env import PlaywrightEnv, resolve_device
+from handoff import load_handoff
 from judge import RubricJudge
 from local_app import start_local_app
 from probe import ProbeConfig
@@ -135,6 +136,7 @@ async def run_probe(
     rubric: dict[str, Any],
     *,
     preview_error: str | None = None,
+    handoff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Judge every leaf of the task's rubric tree on the running app."""
     model = os.environ.get("VLM_MODEL", "Qwen/Qwen2.5-VL-32B-Instruct").strip()
@@ -174,7 +176,13 @@ async def run_probe(
                 deadline_s=deadline_s,
                 source_root=APP_DIR,
                 trace_sink=sink,
-            ).evaluate(app_url, rubric, device=device, preview_error=preview_error)
+            ).evaluate(
+                app_url,
+                rubric,
+                device=device,
+                preview_error=preview_error,
+                handoff=handoff,
+            )
         finally:
             await env.stop()
     finally:
@@ -236,6 +244,19 @@ def main() -> int:
 
     app_spec = json.loads(APP_SPEC_PATH.read_text(encoding="utf-8"))
     rubric = json.loads(RUBRIC_PATH.read_text(encoding="utf-8"))
+    try:
+        handoff = load_handoff(APP_DIR)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        _write_report(
+            {
+                "status": "evaluator_failed",
+                "scoring": "disabled",
+                "score": None,
+                "failure_category": "source_transfer_incomplete",
+                "error": f"Source handoff validation failed: {type(exc).__name__}",
+            }
+        )
+        return 1
     app_url = os.environ.get("APP_BASE_URL", "").strip()
     preview_error = (
         wait_for_app_ready(app_url, APP_READY_TIMEOUT)
@@ -244,7 +265,9 @@ def main() -> int:
     )
     try:
         report = asyncio.run(
-            run_probe(app_url, app_spec, rubric, preview_error=preview_error)
+            run_probe(
+                app_url, app_spec, rubric, preview_error=preview_error, handoff=handoff
+            )
         )
     except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
         report = {
@@ -260,6 +283,7 @@ def main() -> int:
         }
     report["execution_source"] = "remote_preview"
     report.setdefault("preview_readiness_error", preview_error)
+    report["handoff"] = handoff
     _write_report(report)
     status = str(report.get("status") or "evaluator_failed")
     print(f"=== Exploratory probe report: {REPORT_PATH} ({status}) ===")

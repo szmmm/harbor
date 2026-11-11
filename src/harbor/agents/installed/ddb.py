@@ -63,6 +63,13 @@ import httpx
 import zstandard
 
 from harbor.agents.base import BaseAgent
+from harbor.agents.installed.ddb_handoff import (
+    WorkspaceTransferError,
+    download_complete_workspace,
+    execution_completed,
+    extract_workspace_archive,
+    make_handoff,
+)
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.utils.logger import logger as global_logger
@@ -99,7 +106,7 @@ SOURCE_CODES_SANDBOX_PATH = "/tmp/DDB_App_source_codes.txt"
 TRAJECTORY_SANDBOX_PATH = "/tmp/harbor_trajectory.json"
 WORKSPACE_SANDBOX_PATH = "/app/workspace"
 # Keep application sources/assets; Next.js build intermediates are disposable.
-WORKSPACE_EXCLUDE_PATTERN = r"^\.git/|^node_modules/|^dist/|^tool_call_logs/|^\.next/"
+WORKSPACE_EXCLUDE_PATTERN = r"^\.git/|^node_modules/|^tool_call_logs/|^\.next/"
 
 
 logger: logging.Logger = global_logger.getChild(__name__)
@@ -595,9 +602,10 @@ class DDB(BaseAgent):
         if not url:
             return None
         if not url.startswith(self._base_url + "/"):
-            raise RuntimeError(
-                f"Unexpected preview url: {url} for base_url {self._base_url}"
+            self._preview_publication_error = (
+                "Preview URL does not match the configured DDB origin"
             )
+            return None
         return f"{self._preview_base_url}/{url[len(self._base_url) + 1 :]}"
 
     @staticmethod
@@ -797,6 +805,20 @@ class DDB(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        # A timeout must not let the verifier mistake a partial transfer for
+        # missing actor output. Only the final validated handoff replaces this.
+        handoff_path = self.logs_dir / "judge-handoff.json"
+        handoff_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "execution": {"status": "running"},
+                    "source_transfer": {"complete": False},
+                }
+            )
+            + "\n"
+        )
+        await environment.upload_file(handoff_path, "/tmp/harbor_ddb_handoff.json")
         listener = await _acquire_listener(
             bind_host=self._callback_bind_host,
             bind_port=self._callback_bind_port,
@@ -848,7 +870,7 @@ class DDB(BaseAgent):
                     success = (
                         result.get("success") if isinstance(result, dict) else False
                     )
-                    if not success:
+                    if not execution_completed(task):
                         failure = await self._capture_failure(task, session_id)
                         context.metadata["ddb_failure"] = failure
                         error = failure["error"]
@@ -936,19 +958,18 @@ class DDB(BaseAgent):
         )
         self.populate_context(context, task)
 
-        build = next(
-            (
-                event.get("data", {})
-                for event in reversed(task.get("events", []))
-                if event.get("type") == "build_complete"
-            ),
-            {},
+        # A completed execution may have produced a broken app. That is judge
+        # evidence, not a reason to discard the actor's work before verification.
+        handoff = make_handoff(task, self._workspace_transfer, secret=self._api_key)
+        handoff["preview_publication_error"] = getattr(
+            self, "_preview_publication_error", None
         )
-        if build.get("success") is False:
-            raise RuntimeError(
-                f"preview_build_failed: task {task_id}, app {app_id}, "
-                f"mode={build.get('mode')}: {build.get('error') or 'Unknown build error'}"
-            )
+        handoff_path = self.logs_dir / "judge-handoff.json"
+        handoff_path.write_text(
+            json.dumps(handoff, ensure_ascii=False, indent=2) + "\n"
+        )
+        await environment.upload_file(handoff_path, "/tmp/harbor_ddb_handoff.json")
+        context.metadata["judge_handoff"] = handoff
 
     # ------------------------------------------------------------------
     # Headless API
@@ -1358,9 +1379,10 @@ class DDB(BaseAgent):
                     f"Published DDB preview URL to sandbox {PREVIEW_URL_SANDBOX_PATH}"
                 )
             except Exception as exc:
-                self.logger.warning(
-                    f"Failed to publish DDB preview URL to sandbox: {exc}"
+                self._preview_publication_error = (
+                    f"Preview URL publication failed: {type(exc).__name__}"
                 )
+                self.logger.warning(self._preview_publication_error)
         # 2. Upload source code list
         marker = self.logs_dir / "source_codes.txt"
         marker.write_text("\n".join(source_codes))
@@ -1375,51 +1397,32 @@ class DDB(BaseAgent):
             )
         # 3. Upload workspace
         if not app_id:
-            self.logger.warning("DDB reported no app id; the sandbox gets no sources")
-            return
+            raise WorkspaceTransferError(
+                "Completed DDB task has no app id for source retrieval"
+            )
         local_dir = self.logs_dir / "workspace"
-        try:
-            pulled = await self.pull_workspace(app_id, local_dir)
-        except Exception as exc:
-            self.logger.warning(f"Failed to pull workspace for DDB app {app_id}: {exc}")
-            return
-        if not pulled:
-            self.logger.warning(
-                f"Workspace for DDB app {app_id} yielded no files; the sandbox gets no sources"
-            )
-            return
-        try:
-            await environment.ensure_dirs([WORKSPACE_SANDBOX_PATH])
-            await environment.upload_dir(local_dir, WORKSPACE_SANDBOX_PATH)
-            self.logger.debug(
-                f"Published workspace for DDB app {app_id} to sandbox {WORKSPACE_SANDBOX_PATH}"
-            )
-        except Exception as exc:
-            self.logger.warning(
-                f"Failed to publish workspace for DDB app {app_id} to sandbox: {exc}"
-            )
+        await self.pull_workspace(app_id, local_dir)
+        await environment.ensure_dirs([WORKSPACE_SANDBOX_PATH])
+        await environment.upload_dir(local_dir, WORKSPACE_SANDBOX_PATH)
+        receipt = self.logs_dir / "workspace-transfer.json"
+        receipt.write_text(json.dumps(self._workspace_transfer, indent=2) + "\n")
+        await environment.upload_file(receipt, "/tmp/harbor_workspace_transfer.json")
 
     # ------------------------------------------------------------------
     # Workspace export
     # ------------------------------------------------------------------
 
-    # A workspace pull is one archive download, or one listing plus one request per file.
+    # A verified pull checks inventories before/after, with retried per-file reads.
     WORKSPACE_TIMEOUT_SEC = 300.0
     WORKSPACE_LIST_DEPTH = 32
     WORKSPACE_READ_CONCURRENCY = 8
 
     async def pull_workspace(self, app_id: str, local_dir: Path) -> bool:
-        """Download the app DDB generated into ``local_dir``; did anything arrive?
+        """Download the complete exported workspace, or report a transfer error.
 
-        Two routes are tried in order:
-
-        1. the packaged snapshot archive (``GET .../download``) -- one request,
-           and it carries binary files too. DDB answers 409 until it has
-           packaged one and some apps never get one, so this is a fast path,
-           not the contract;
-        2. the per-file API (list + read), which keeps working even after the
-           task record expires (DDB drops completed tasks after ~30 min) but
-           only returns text files.
+        Use the existing saved archive when available, otherwise existing file
+        APIs. Preserve product paths and record upstream visibility limitations.
+        A completed transfer is not a claim of exhaustive remote visibility.
         """
         files_url = f"/api/files/{app_id}"
         shutil.rmtree(local_dir, ignore_errors=True)
@@ -1434,9 +1437,10 @@ class DDB(BaseAgent):
             timeout=httpx.Timeout(self.WORKSPACE_TIMEOUT_SEC),
             follow_redirects=True,
         ) as client:
-            if await self._pull_workspace_archive(client, files_url, local_dir):
-                return True
-            return await self._pull_workspace_files(client, files_url, local_dir)
+            async with asyncio.timeout(self.WORKSPACE_TIMEOUT_SEC):
+                if await self._pull_workspace_archive(client, files_url, local_dir):
+                    return True
+                return await self._pull_workspace_files(client, files_url, local_dir)
 
     async def _pull_workspace_archive(
         self, client: httpx.AsyncClient, files_url: str, local_dir: Path
@@ -1446,9 +1450,9 @@ class DDB(BaseAgent):
             response = await client.get(f"{files_url}/download")
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}")
-            _unpack_workspace_archive(response.content, local_dir)
-            _strip_single_root(local_dir)
-            _prune_workspace(local_dir)
+            self._workspace_transfer = extract_workspace_archive(
+                response.content, local_dir
+            )
         except Exception as exc:
             self.logger.debug(f"No DDB workspace archive ({exc}); pulling file by file")
             shutil.rmtree(local_dir, ignore_errors=True)
@@ -1460,76 +1464,47 @@ class DDB(BaseAgent):
     async def _pull_workspace_files(
         self, client: httpx.AsyncClient, files_url: str, local_dir: Path
     ) -> bool:
-        """Fallback: walk the listing and read each file out of DDB.
-
-        Unlike the archive, a failure to list is fatal to the pull: there is no third route,
-        and the caller needs to hear why the sandbox got no sources.
-        """
-        response = await client.get(
+        self._workspace_transfer = await download_complete_workspace(
+            client,
             files_url,
-            params={
-                "path": "",
-                "max_depth": self.WORKSPACE_LIST_DEPTH,
-                "mode": "browse",
-            },
+            local_dir,
+            self._read_workspace_file,
+            max_depth=self.WORKSPACE_LIST_DEPTH,
+            concurrency=self.WORKSPACE_READ_CONCURRENCY,
         )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Listing the DDB workspace failed: HTTP {response.status_code}: {response.text}"
-            )
-        exclude = re.compile(WORKSPACE_EXCLUDE_PATTERN)
-        root = local_dir.resolve()
-        targets: list[tuple[str, Path]] = []
-        for path in _iter_file_paths(response.json().get("files")):
-            relative = path.lstrip("/")
-            if exclude.search(relative):
-                continue
-            destination = (local_dir / relative).resolve()
-            if not destination.is_relative_to(root):
-                self.logger.debug(
-                    f"Skipped DDB workspace file {path}: it escapes {local_dir}"
-                )
-                continue
-            targets.append((path, destination))
-
-        contents: list[bytes | None] = [None] * len(targets)
-        semaphore = asyncio.Semaphore(self.WORKSPACE_READ_CONCURRENCY)
-
-        async def read_into(index: int, path: str) -> None:
-            async with semaphore:
-                contents[index] = await self._read_workspace_file(
-                    client, files_url, path
-                )
-
-        async with asyncio.TaskGroup() as group:
-            for index, (path, _) in enumerate(targets):
-                group.create_task(read_into(index, path))
-
-        written = 0
-        for (path, destination), content in zip(targets, contents):
-            if content is None:
-                self.logger.debug(
-                    f"Skipped DDB workspace file {path}: binary or unreadable"
-                )
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-            written += 1
         self.logger.debug(
-            f"Pulled {written}/{len(targets)} DDB workspace files to {local_dir}"
+            "Completed source transfer: %d files",
+            self._workspace_transfer["files_downloaded"],
         )
-        return written > 0
+        return True  # An authoritative empty workspace is also a complete export.
 
     async def _read_workspace_file(
-        self, client: httpx.AsyncClient, files_url: str, path: str
+        self,
+        client: httpx.AsyncClient,
+        files_url: str,
+        path: str,
+        *,
+        source: str | None = None,
     ) -> bytes | None:
         """Return original file bytes, honoring the files API encoding."""
-        for params in ({"path": path}, {"path": path, "mode": "browse"}):
+        for params in (
+            {
+                "path": path,
+                "mode": "edit" if source == "live" else "browse",
+            },
+        ):
             try:
                 response = await client.get(f"{files_url}/read", params=params)
                 if response.status_code >= 400:
                     continue
                 payload = response.json()
+                if payload.get("degraded") or payload.get("source") in {
+                    "live_stale",
+                    "deferred",
+                }:
+                    continue
+                if source in {"live", "snapshot"} and payload.get("source") != source:
+                    continue  # Do not mix live files with an older snapshot.
                 content = payload.get("content")
             except (httpx.HTTPError, ValueError) as exc:
                 self.logger.debug(f"Reading DDB workspace file {path} failed: {exc}")

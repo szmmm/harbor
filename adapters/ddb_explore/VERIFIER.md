@@ -30,7 +30,9 @@ The judge has more tools for leaves that the screen alone cannot decide:
   as a new browser or device, for checks that data is stored on a server.
 - `list_source_files`, `read_source_file`, `search_source`: read-only access
   to the builder's workspace in `/app/workspace`, which the DDB agent uploads
-  without `.git`, `node_modules` and `dist`. They are for checks about the
+  without installed dependencies, caches and platform skill/catalog links.
+  Application manifests, source, lockfiles, assets, logs and built `dist` output
+  are retained. They are for checks about the
   framework, external scripts, single-file delivery, and where data is stored.
   In the 100 rubrics of `dsv4-rand100-max-t1`, 44 critical leaves need the
   source or a new session.
@@ -54,16 +56,19 @@ overall deadline.
 
 ## Scoring
 
-`rubric_score.py` computes a weighted pass rate: critical leaves have weight 2,
-and non-critical leaves have weight 1. Reward is the total weight of PASS
-leaves divided by the total weight of leaves with PASS or FAIL. A critical
-failure does not force the reward to zero. Branches only group leaves.
+`rubric_score.py` uses `rubric-tree-v2`: critical leaves have weight 2 and
+other leaves weight 1. Reward is PASS weight divided by the weight of **all**
+rubric leaves. Fully assessed scores are unchanged. Unassessed leaves earn no
+credit but retain UNKNOWN (UNTESTED in generated tasks), rather than being
+rewritten to FAIL. Coverage, branch pass rates and unresolved critical IDs remain
+diagnostic; partial assessments have `scoring_status: partial`.
 
-UNKNOWN leaves have no verdict. A critical leaf without a verdict makes the
-score unavailable, including when another critical leaf fails. Coverage
-(leaves with PASS or FAIL, divided by all leaves) is diagnostic only and has
-no minimum requirement. UNKNOWN (called UNTESTED in generated tasks) leaves
-are excluded from the weighted denominator.
+A normally completed judge evaluation with at least one accepted PASS/FAIL can
+produce a reward even when critical checks remain unresolved. An assessment
+with no usable verdicts, a judge/API error, or an exhausted deadline still has
+no reward. This deliberately prioritizes usable conservative training rewards:
+a preview outage may lower the score, and a few source-only passes cannot inflate
+an otherwise untested app to a perfect score.
 
 `reward.json` has `reward`, the enabled components (`vlm_reward`,
 `trajectory_reward`), and diagnostics that the slime bridge logs but does not
@@ -175,6 +180,80 @@ judge retains the same rubric, browser/source tools, budgets and scoring rules.
 Initial navigation failures and subsequent failed browser retries are saved as
 failed observations, so the judge can inspect sources or retry the preview.
 There is no separate judge, automatic zero, or local workspace startup fallback.
-A normal evidence-supported zero remains a valid reward; unresolved critical
-checks or judge failures still produce no reward. Rollout-only runs with the
+A normal evidence-supported zero remains a valid reward. Unresolved critical
+checks no longer suppress partial rewards; judge failures still produce no reward. Rollout-only runs with the
 verifier disabled remain unaffected.
+
+### Completed-task handoff and local source
+
+DDB's API lifecycle must reach `status: completed` before grading. This is
+separate from the actor's self-reported `task_done.completion_status`, which
+the headless API does not normally expose. Build success and preview readiness
+are diagnostic outcomes, not admission gates. Failed/cancelled/running
+executions still do not enter grading.
+
+Harbor writes a pending handoff before execution. It first tries DDB's existing
+saved workspace download, preserving original paths rather than guessing that a
+single subdirectory is an archive wrapper. A damaged/unavailable archive falls
+back to the existing file-list/read APIs. The per-file path retries every
+advertised file and fails if any of those downloads remain incomplete. It also
+requests `.deepdiver`, `dist`, `build` and `out` subtrees explicitly, since
+the normal UI listing may hide them, and probes the artifact declaration when
+it was not listed. Unavailable optional probes are recorded without claiming
+that the actor failed to create those files. Read responses must match the
+inventory's live/snapshot source label; stale/degraded reads are rejected.
+
+Only after the downloads and sandbox upload finish does verifier code check
+the local bytes against Harbor's receipt. These are automatic Python checks,
+not judge-model calls. They verify upload integrity, not remote inventory
+completeness or freshness. The existing API supplies no pinned revision or
+remote hashes; saved snapshots may be older, omit dist/runtime evidence, and
+listings can filter directories or cap depth. The handoff explicitly records
+these limitations and sets `inventory_complete: false`. A missing file in this
+local copy therefore is not sufficient evidence that the actor omitted it.
+
+The same rubric judge receives execution, actor claims, build outcome, preview
+readiness and source-transfer diagnostics. The judge-facing build context renames
+`success` to `platform_reported_success` and explains the mode: `live` confirms
+only a runtime/session, and `none` means the build was skipped. Neither verifies
+compilation or HTTP readiness. Raw handoff values remain in the audit report.
+Initial readiness errors have unknown attribution, not an infrastructure label.
+The canonical and generated prompts use the same verdict policy (apart from
+UNKNOWN/UNTESTED terminology): proven blockers fail dependent requirements;
+missing observations or evaluator capabilities remain unassessed. Failed tool
+observations can support FAIL, but do not automatically establish app fault;
+PASS still requires successful observations and actual interaction evidence. It can page through file listings,
+read source in chunks and search. Positive code evidence can support a verdict
+for a failed app, while uncertain omissions remain UNKNOWN/UNTESTED. Source
+cannot prove visual or interactive success. The failure prompt asks the judge to
+inspect delivery configuration early, apply a demonstrated blocking defect to
+requirements that depend on it, and distinguish a deferred execution with no
+artifact from an incomplete export. It asks for at most three preview recovery
+actions without meaningful progress before source assessment and final verdicts;
+this is model guidance, not a hard tool budget. When readiness fails, available
+root `package.json` and `.deepdiver/artifact.json` are supplied as cited source
+observations before the first judge call, so nested app manifests do not obscure
+the actual startup configuration. Uncertain infrastructure failures
+may still remain UNKNOWN/UNTESTED. Configured budgets are unchanged; partial scoring follows the v2 rule above.
+
+No dependency installation is needed to read source. Harbor retains app source,
+artifact declarations, package manifests, lockfiles, vendored source, assets,
+build outputs and preview logs whenever they are returned. Installed dependency
+directories, caches, Git history, tool-call logs and platform skill/catalog links
+are excluded. DDB's current snapshot producer itself excludes the normal root
+`node_modules/`, `dist/` and `.deepdiver/preview/` before packaging. Harbor
+cannot recover files that an upstream saved archive no longer contains.
+
+The judge only reads the local copy; it has no new tools for the actor sandbox.
+No DDB client/server changes or custom export endpoints are required. The
+previous proposed DDB export API was reverted. Existing processes are unchanged
+until Harbor is reloaded, and rollout-only runs remain verification-disabled.
+
+The judge can inspect popup tabs explicitly: `list_tabs` returns stable tab IDs,
+titles, active status and URLs without credentials/query/fragment; `switch_tab`
+selects a live tab in the current browser profile without navigating or clearing
+storage. Popup events include their tab ID but do not automatically change focus.
+Switching refreshes element references; screenshots and actions then target the
+selected page. Closed tabs and tabs from an old profile cannot be selected.
+Tab selection itself is not interaction evidence for a feature PASS. These tools
+do not change retry budgets, scoring, or the immediate meaning of `finish`.
