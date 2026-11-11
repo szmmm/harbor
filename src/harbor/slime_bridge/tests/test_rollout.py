@@ -1950,3 +1950,54 @@ class TestSamplingFlagsParse:
             "temperature": 1.0,
             "top_p": 1.0,
         }
+
+
+def test_all_failed_batch_is_recorded_and_returns_without_refill(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from harbor.slime_bridge import stability
+
+    args = Namespace(
+        rollout_batch_size=2, n_samples_per_prompt=2, harbor_stability_dir=str(tmp_path)
+    )
+    groups = [
+        [Sample(metadata={"task_id": task}) for _ in range(2)]
+        for task in ["one", "two"]
+    ]
+    source = SimpleNamespace(
+        get_samples=lambda n: groups, add_samples=lambda groups: None
+    )
+    monkeypatch.setattr(stability, "_sync_sampling_overrides", AsyncMock())
+    invoke = AsyncMock(
+        return_value={
+            "one": [
+                TrialRollout(
+                    task_id="one",
+                    error="task failed",
+                    output_state={"preview_status": "generation_or_build_failed"},
+                )
+            ],
+            "two": [],
+        }
+    )
+    monkeypatch.setattr(stability, "_run_harbor_distributed", invoke)
+    result = asyncio.run(stability._rollout(args, 1, source))
+    invoke.assert_awaited_once()
+    assert len(result.samples) == 4
+    assert all(s.reward is None for s in result.samples)
+    assert result.metrics["stability/errors"] == 1
+    assert result.metrics["stability/missing"] == 3
+    report = json.loads((tmp_path / "step-0001.json").read_text())
+    assert report["optimizer_updates"] is False
+    assert (
+        report["trials"][0]["output_state"]["preview_status"]
+        == "generation_or_build_failed"
+    )
+
+
+def test_disabled_verification_cannot_enter_training():
+    with pytest.raises(RuntimeError, match="rollout-only"):
+        rollout_mod.generate_rollout(
+            Namespace(harbor_disable_verification=True), 1, None
+        )

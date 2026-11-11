@@ -503,3 +503,31 @@ def test_agent_timeout_kwarg_stays_below_the_agent_phase_cap(tmp_path, monkeypat
     agent = captured["config"].agents[0]
     assert agent.kwargs["task_timeout_sec"] == 4500
     assert agent.kwargs["task_timeout_sec"] < 1200 * client.config.timeout_multiplier
+
+@pytest.mark.parametrize("disable", [False, True])
+def test_job_verification_is_opt_in_disabled(monkeypatch, tmp_path, disable):
+    from unittest.mock import AsyncMock
+
+    from harbor.slime_bridge import harbor_client
+
+    (tmp_path / "one").mkdir()
+    cfg = HarborConfig.from_env(
+        dataset_dir=tmp_path,
+        proxy_url="http://proxy",
+        ddb_base_url="http://ddb",
+        ddb_api_key="test",
+        ddb_preview_base_url="http://preview",
+        vlm_api_base_url="http://judge",
+        vlm_api_key="test",
+        vlm_model="test",
+    )
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            run=AsyncMock(return_value=SimpleNamespace(trial_results=[]))
+        )
+    )
+    monkeypatch.setattr(harbor_client.Job, "create", create)
+    asyncio.run(HarborRolloutClient(cfg).run(["one"], disable_verification=disable))
+    job = create.call_args.args[0]
+    assert job.verifier.disable is disable
+    assert job.agents[0].kwargs["log_preview_state"] is disable

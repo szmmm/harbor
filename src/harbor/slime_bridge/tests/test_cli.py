@@ -347,3 +347,25 @@ class TestOneStepAtATime:
 
         assert busy is True
         assert idle is False
+
+
+@pytest.mark.parametrize(
+    "flag,urls,attribute",
+    [
+        ("--harbor-service-url", ["http://h20:9500"], "harbor_service_url"),
+        (
+            "--harbor-service-urls",
+            ["http://h20:9500", "http://h20-2:9500"],
+            "harbor_service_urls",
+        ),
+    ],
+)
+def test_bridge_service_arguments(flag, urls, attribute):
+    import argparse
+
+    from harbor.slime_bridge.args import add_harbor_arguments
+
+    args = add_harbor_arguments(argparse.ArgumentParser()).parse_args([flag, *urls])
+    assert getattr(args, attribute) == (
+        urls[0] if flag == "--harbor-service-url" else urls
+    )

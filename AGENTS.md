@@ -216,7 +216,12 @@ uv run pytest tests/ --cov=src/harbor --cov-report=term-missing
 
 ### Running Tests
 
-**When verifying changes, only run `uv run pytest tests/unit/` unless the change specifically affects integration-tested code and integration tests are necessary.**
+**For RL pipeline changes, run only the affected test files or specific test node IDs. Do not run the entire unit suite, bridge suite, or adapter suite after every edit.** Broaden only when a concrete cross-component risk or failure warrants it, or the user requests it.
+
+Test canonical verifier logic once. Generated task copies are deployment artifacts;
+check their synchronization only when changing generation or deploying verifier
+artifacts, rather than multiplying behavioral tests by the dataset size. Saved-case
+browser/model replays are targeted integration checks, not a routine post-edit step.
 
 Do not test CLI help panels. Typer/Rich help output changes with terminal width,
 colors, and platform; test command behavior, parser wiring, or callback effects instead.
@@ -257,7 +262,9 @@ uv run ruff check --fix .
 uv run ty check
 ```
 
-Always run `uv run ruff check --fix .`, `uv run ruff format .`, and `uv run ty check` after making any code changes.
+For RL pipeline work, scope Ruff and type checks to changed code. Use explicit file
+paths and a verified working directory; do not run repository-wide auto-fixes or
+formatting as routine validation. Documentation-only changes do not need tests.
 
 ## CI/CD Workflows
 
