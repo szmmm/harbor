@@ -225,11 +225,10 @@ observations can support FAIL, but do not automatically establish app fault;
 PASS still requires successful observations and actual interaction evidence. It can page through file listings,
 read source in chunks and search. Positive code evidence can support a verdict
 for a failed app, while uncertain omissions remain UNKNOWN/UNTESTED. Source
-cannot prove visual or interactive success. The failure prompt asks the judge to
-inspect delivery configuration early, apply a demonstrated blocking defect to
-requirements that depend on it, and distinguish a deferred execution with no
-artifact from an incomplete export. It asks for at most three preview recovery
-actions without meaningful progress before source assessment and final verdicts;
+cannot prove visual or interactive success. The prompt uses general evidence
+rules rather than a separate failure workflow or delivery-specific verdict recipes.
+It asks for at most three preview recovery actions without meaningful progress
+before assessing available evidence and finishing;
 this is model guidance, not a hard tool budget. When readiness fails, available
 root `package.json` and `.deepdiver/artifact.json` are supplied as cited source
 observations before the first judge call, so nested app manifests do not obscure

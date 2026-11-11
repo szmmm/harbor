@@ -71,29 +71,11 @@ Verdicts (cite saved evidence IDs and explain what they establish):
   execute a check does not when a proven app defect already blocks it. A preview
   timeout alone proves neither app fault nor infrastructure fault.
 
-When the preview fails:
-1. Inspect the current page and popups. Read root package.json,
-   .deepdiver/artifact.json and the actual entrypoint early. Startup uses the
-   workspace root unless explicitly configured otherwise: a nested app's package
-   or manually started server does not wire root startup to it. Named HTML needs
-   a site entry/file declaration or working root configuration; the inherited
-   Vite script is insufficient. Next.js does not require index.html. Do not
-   repair the app or launch a replacement local copy.
-2. Interpret handoff metadata literally: execution completed means the actor
-   stopped; its final answer is a claim. Build mode live confirms a runtime,
-   not compilation or HTTP readiness; none means skipped. Deferred runtime
-   export + zero files + build mode none means no artifact was materialized:
-   requirements depending on that deliverable FAIL.
-3. Unverified inventory makes omissions uncertain, not concrete defects in
-   readable files. Check named paths/configuration; dependencies and caches are
-   intentionally excluded. An empty partial export alone proves no absence.
-   Use current configuration and latest diagnostics, not obsolete command logs,
-   to attribute failure. State uncertainty instead of guessing.
-4. Allow at most three recovery actions without meaningful progress, combined
-   across wait, reload, open_app and return_to_app. Another starting spinner is
-   not progress; a usable popup or rendered app is. Then assess source, FAIL
-   demonstrated blockers and dependent requirements, mark remaining checks
-   UNKNOWN, and finish.
+Use current evidence and respect the handoff's stated limitations. Missing files
+in an unverified export do not prove actor omissions; concrete defects in readable
+files can still establish failure. Assess the submitted app without repairing it.
+Limit wait/reload/open_app/return_to_app to three attempts without meaningful
+progress, then assess available evidence and finish; another spinner is not progress.
 
 Record verdicts promptly, batching related leaves. Later verdicts replace earlier
 ones. Record every leaf before finish. UNKNOWN is allowed: a completed assessment
@@ -793,8 +775,8 @@ class RubricJudge(ProbeAgent):
             task["preview_readiness_note"] = (
                 "The preview was unavailable at the initial check. The cause is "
                 "not established: it may be the delivery or the preview service. "
-                "Inspect the supplied root configuration and source using the "
-                "failure workflow. Do not infer a successful build from mode live."
+                "Inspect the supplied root configuration and source. "
+                "Do not infer a successful build from mode live."
             )
             task_json = json.dumps(task, ensure_ascii=False)
         messages = [
@@ -820,7 +802,7 @@ class RubricJudge(ProbeAgent):
                         "success": False,
                         "error": _safe_preview_error(exc),
                         "preview_readiness_error": self.preview_error,
-                        "note": "Navigation failed; cause unestablished. Use the failure workflow to inspect delivery evidence and make bounded recovery attempts.",
+                        "note": "Navigation failed; cause unestablished. Inspect available delivery evidence and keep recovery attempts bounded.",
                     },
                 )
             first = {
