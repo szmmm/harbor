@@ -12,7 +12,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-SUPPORTED_TRAINING_AGENTS = frozenset(name.lower() for name in ("DDTAgent", "DDT_Agent"))
+SUPPORTED_TRAINING_AGENTS = frozenset(
+    name.lower() for name in ("DDTAgent", "DDT_Agent")
+)
 
 
 # agent_id format: {role}{32-hex uuid}, minted per agent *instance* by the DDB
@@ -24,7 +26,9 @@ def agent_name_of(agent_id: str) -> str:
     return agent_id[:-32]
 
 
-def is_trained_agent(agent_id: str, agents: frozenset[str] = SUPPORTED_TRAINING_AGENTS) -> bool:
+def is_trained_agent(
+    agent_id: str, agents: frozenset[str] = SUPPORTED_TRAINING_AGENTS
+) -> bool:
     """Whether this agent's recorded stream becomes a training sample."""
     return agent_name_of(agent_id).lower() in agents
 
@@ -82,6 +86,7 @@ class TrialRollout:
     session_id: str | None = None
     ddb_task_id: str | None = None
     error: str | None = None
+    output_state: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tokens(self) -> bool:

@@ -16,6 +16,10 @@ import argparse
 
 def add_harbor_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("harbor.slime_bridge")
+    group.add_argument(
+        "--harbor-disable-verification", action="store_true", default=False
+    )
+    group.add_argument("--harbor-stability-dir", type=str, default=None)
 
     # --- the harbor service -----------------------------------------------
     group.add_argument(

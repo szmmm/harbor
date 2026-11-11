@@ -76,6 +76,7 @@ class RolloutRequest(BaseModel):
     #: cancelled trials are dropped from the response.  Tasks not listed run
     #: all ``n_attempts``.  Validated against ``task_ids`` by the client.
     n_targets: dict[str, int] | None = None
+    disable_verification: bool = False
 
 
 _RUNNER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -178,11 +179,17 @@ def build_app(
             )
         async with lock:
             try:
+                options = (
+                    {"disable_verification": True}
+                    if request.disable_verification
+                    else {}
+                )
                 results = await client.run(
                     request.task_ids,
                     n_attempts=request.n_attempts,
                     run_label=request.run_label,
                     n_targets=request.n_targets,
+                    **options,
                 )
             except (
                 ValueError

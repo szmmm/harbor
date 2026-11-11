@@ -86,6 +86,10 @@ def generate_rollout(
     non-None, identical ``rollout_id`` on every sibling -- exactly what we want,
     so the loss reducer counts one trial once rather than once per agent.
     """
+    if getattr(args, "harbor_disable_verification", False):
+        raise RuntimeError(
+            "Disabled verification requires the rollout-only stability entry point."
+        )
     if evaluation:
         return run(_eval(args, rollout_id))
     return run(_train(args, rollout_id, data_source))
@@ -697,6 +701,8 @@ async def _run_harbor(
         "n_attempts": n_trials,
         "run_label": run_label,
     }
+    if getattr(args, "harbor_disable_verification", False):
+        body["disable_verification"] = True
     if n_targets is not None and len(n_targets) > 0:
         body["n_targets"] = n_targets
     token = os.getenv("HARBOR_RUNNER_TOKEN")

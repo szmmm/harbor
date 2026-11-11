@@ -528,6 +528,7 @@ class DDB(BaseAgent):
         platform: str | None = None,
         task_timeout_sec: float = 7200,
         publish_preview_url: bool = True,
+        log_preview_state: bool = False,
         training: bool = True,
         proxy_url: str | None = None,
         trajectory_score_type: str = DEFAULT_TRAJECTORY_SCORE_TYPE,
@@ -538,6 +539,7 @@ class DDB(BaseAgent):
         self._platform = platform
         self._task_timeout_sec = task_timeout_sec
         self._publish_preview_url = publish_preview_url
+        self._log_preview_state = log_preview_state
         self.training = training
         self.proxy_url = proxy_url
         self.trajectory_score_type = trajectory_score_type.lower()
@@ -839,6 +841,8 @@ class DDB(BaseAgent):
                     (self.logs_dir / "task.json").write_text(
                         json.dumps(task, indent=4, ensure_ascii=False)
                     )
+                    if self._log_preview_state:
+                        await self._record_output_state(task, context)
 
                     result = task.get("result")
                     success = (
@@ -949,6 +953,21 @@ class DDB(BaseAgent):
     # ------------------------------------------------------------------
     # Headless API
     # ------------------------------------------------------------------
+
+    async def _record_output_state(
+        self, task: dict[str, Any], context: AgentContext
+    ) -> None:
+        """One bounded, non-gating HTTP observation before remote app cleanup."""
+        from harbor.slime_bridge.preview_state import observe_output_state
+
+        state = await observe_output_state(task, self._public_preview_url)
+        context.metadata["output_state"] = state
+        (self.logs_dir / "output-state.json").write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n"
+        )
+        self.logger.info(
+            "DDB final output state: %s", json.dumps(state, ensure_ascii=False)
+        )
 
     SUBMIT_READ_TIMEOUT_SEC = 300.0
     SUBMIT_ATTEMPTS = 4

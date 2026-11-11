@@ -35,13 +35,19 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from harbor.slime_bridge.docker_host import default_preview_base_url
-from harbor.slime_bridge.trial import TrialRollout, is_trained_agent
+
 from harbor.job import Job
 from harbor.models.agent.name import AgentName
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig
-from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, VerifierConfig
+from harbor.models.trial.config import (
+    AgentConfig,
+    EnvironmentConfig,
+    TaskConfig,
+    VerifierConfig,
+)
+from harbor.slime_bridge.docker_host import default_preview_base_url
+from harbor.slime_bridge.trial import TrialRollout, is_trained_agent
 from harbor.utils.trajectory_utils import DEFAULT_TRAJECTORY_SCORE_TYPE
 
 logger = logging.getLogger(__name__)
@@ -89,14 +95,25 @@ class HarborConfig:
             "proxy_url": os.environ.get("PROXY_URL", ""),
             "ddb_base_url": os.environ.get("DDB_BASE_URL", ""),
             "ddb_api_key": os.environ.get("DDB_API_KEY", ""),
-            "ddb_preview_base_url": os.environ.get("DDB_PREVIEW_BASE_URL") or default_preview_base_url(backend_port),
-            "trajectory_score_type": os.environ.get("TRAJECTORY_SCORE_TYPE", DEFAULT_TRAJECTORY_SCORE_TYPE),
+            "ddb_preview_base_url": os.environ.get("DDB_PREVIEW_BASE_URL")
+            or default_preview_base_url(backend_port),
+            "trajectory_score_type": os.environ.get(
+                "TRAJECTORY_SCORE_TYPE", DEFAULT_TRAJECTORY_SCORE_TYPE
+            ),
             "code_review_eval": os.environ.get("CODE_REVIEW_EVAL", "1"),
-            "code_review_issue_cap": float(os.environ.get("CODE_REVIEW_ISSUE_CAP") or 16.0),
+            "code_review_issue_cap": float(
+                os.environ.get("CODE_REVIEW_ISSUE_CAP") or 16.0
+            ),
             "code_review_times": int(os.environ.get("CODE_REVIEW_TIMES") or 2),
-            "code_review_timeout_sec": float(os.environ.get("CODE_REVIEW_TIMEOUT_SEC") or 7200),
-            "code_review_critical_weight": float(os.environ.get("CODE_REVIEW_CRITICAL_WEIGHT") or 2),
-            "code_review_high_weight": float(os.environ.get("CODE_REVIEW_HIGH_WEIGHT") or 1),
+            "code_review_timeout_sec": float(
+                os.environ.get("CODE_REVIEW_TIMEOUT_SEC") or 7200
+            ),
+            "code_review_critical_weight": float(
+                os.environ.get("CODE_REVIEW_CRITICAL_WEIGHT") or 2
+            ),
+            "code_review_high_weight": float(
+                os.environ.get("CODE_REVIEW_HIGH_WEIGHT") or 1
+            ),
             "vlm_static_eval": os.environ.get("VLM_STATIC_EVAL", "1"),
             "vlm_api_base_url": os.environ.get("VLM_API_BASE_URL", ""),
             "vlm_api_key": os.environ.get("VLM_API_KEY", ""),
@@ -144,7 +161,9 @@ class HarborConfig:
                 f"harbor task directories, one per task id in the prompt data."
             )
         if self.n_concurrent_trials < 1:
-            raise ValueError(f"n_concurrent_trials must be >= 1, got {self.n_concurrent_trials}")
+            raise ValueError(
+                f"n_concurrent_trials must be >= 1, got {self.n_concurrent_trials}"
+            )
 
 
 class HarborRolloutClient:
@@ -171,6 +190,7 @@ class HarborRolloutClient:
         n_attempts: int = 1,
         run_label: str | None = None,
         n_targets: dict[str, int] | None = None,
+        disable_verification: bool = False,
     ) -> dict[str, list[TrialRollout]]:
         """Run ``n_attempts`` trials of each task; block until all terminate.
 
@@ -190,7 +210,9 @@ class HarborRolloutClient:
         if n_targets:
             unknown = sorted(set(n_targets) - set(task_ids))
             if unknown:
-                raise ValueError(f"n_targets names task ids not in this request: {unknown}")
+                raise ValueError(
+                    f"n_targets names task ids not in this request: {unknown}"
+                )
             bad = {t: n for t, n in n_targets.items() if n < 1}
             if bad:
                 raise ValueError(f"n_targets must be >= 1, got {bad}")
@@ -198,7 +220,10 @@ class HarborRolloutClient:
 
         logger.info(
             "Harbor job %s: %d task(s) x %d attempt(s), concurrency %d",
-            run_label or "adhoc", len(task_ids), n_attempts, cfg.n_concurrent_trials,
+            run_label or "adhoc",
+            len(task_ids),
+            n_attempts,
+            cfg.n_concurrent_trials,
         )
 
         job = await Job.create(
@@ -215,6 +240,7 @@ class HarborRolloutClient:
                             # Verifier targets DDB's preview URL (APP_BASE_URL);
                             # training=True records token IDs/logprobs via the proxy.
                             "publish_preview_url": True,
+                            "log_preview_state": disable_verification,
                             "training": True,
                             "proxy_url": cfg.proxy_url,
                             "trajectory_score_type": cfg.trajectory_score_type,
@@ -233,13 +259,16 @@ class HarborRolloutClient:
                     )
                 ],
                 verifier=VerifierConfig(
+                    disable=disable_verification,
                     # Reaches the dataset's tests as environment variables.
                     env={
                         "CODE_REVIEW_EVAL": cfg.code_review_eval,
                         "CODE_REVIEW_ISSUE_CAP": str(cfg.code_review_issue_cap),
                         "CODE_REVIEW_TIMES": str(cfg.code_review_times),
                         "CODE_REVIEW_TIMEOUT_SEC": str(cfg.code_review_timeout_sec),
-                        "CODE_REVIEW_CRITICAL_WEIGHT": str(cfg.code_review_critical_weight),
+                        "CODE_REVIEW_CRITICAL_WEIGHT": str(
+                            cfg.code_review_critical_weight
+                        ),
                         "CODE_REVIEW_HIGH_WEIGHT": str(cfg.code_review_high_weight),
                         "CODE_REVIEW_HISTORY_FILE": cfg.code_review_history_file,
                         "VLM_STATIC_EVAL": cfg.vlm_static_eval,
@@ -288,7 +317,9 @@ def _is_cancelled_result(trial_result: Any) -> bool:
 
 def _has_trained_stream(token_ids: dict[str, Any]) -> bool:
     """At least one recorded stream belongs to a role the trainer trains."""
-    return any(len(agent_id) > 32 and is_trained_agent(agent_id) for agent_id in token_ids)
+    return any(
+        len(agent_id) > 32 and is_trained_agent(agent_id) for agent_id in token_ids
+    )
 
 
 def _is_usable_result(trial_result: Any) -> bool:
@@ -334,7 +365,10 @@ def _surplus_canceller(job: Any, n_targets: dict[str, int]):
         if cancelled:
             logger.info(
                 "task %s reached its target of %d usable trial(s); cancelled %d surplus: %s",
-                task_id, target, len(cancelled), cancelled,
+                task_id,
+                target,
+                len(cancelled),
+                cancelled,
             )
 
     return cancel_surplus
@@ -358,7 +392,10 @@ def _verifier_score(trial_result: Any) -> float | None:
 #: Per-leg score key -> the reward.json gate that says whether its leg ran.
 #: test.py writes a -1 sentinel for a disabled leg's score; the gate check
 #: keeps that sentinel out of the components rather than trusting its value.
-_COMPONENT_GATES = {"code_review_score": "CODE_REVIEW_EVAL", "vlm_static_score": "VLM_STATIC_EVAL"}
+_COMPONENT_GATES = {
+    "code_review_score": "CODE_REVIEW_EVAL",
+    "vlm_static_score": "VLM_STATIC_EVAL",
+}
 
 
 def _verifier_components(trial_result: Any) -> dict[str, float]:
@@ -391,7 +428,9 @@ def _to_trial_rollout(task_id: str, trial_result: Any) -> TrialRollout:
     metadata = (getattr(agent_result, "metadata", None) or {}) if agent_result else {}
 
     exception_info = getattr(trial_result, "exception_info", None)
-    error = getattr(exception_info, "exception_message", None) if exception_info else None
+    error = (
+        getattr(exception_info, "exception_message", None) if exception_info else None
+    )
 
     # The verifier's ORM score for the whole trial (reward.json's "reward" key
     # only), broadcast to every stream the trial recorded; the per-agent score
@@ -401,6 +440,7 @@ def _to_trial_rollout(task_id: str, trial_result: Any) -> TrialRollout:
 
     trial = TrialRollout(
         task_id=task_id,
+        output_state=metadata.get("output_state") or {},
         verifier_scores=(
             {agent_id: verifier_score for agent_id in token_ids}
             if verifier_score is not None
@@ -421,17 +461,21 @@ def _to_trial_rollout(task_id: str, trial_result: Any) -> TrialRollout:
     if not trial.has_tokens:
         logger.warning(
             "task %s trial %s recorded no token data (error=%s)",
-            task_id, trial.trial_name, error,
+            task_id,
+            trial.trial_name,
+            error,
         )
     else:
         if not trial.trajectory_scores:
             logger.warning(
                 "task %s trial %s recorded token streams but no trajectory_scores; the step will fail if --custom-rm-path trains on the trajectory score.",
-                task_id, trial.trial_name,
+                task_id,
+                trial.trial_name,
             )
         if verifier_score is None:
             logger.warning(
                 "task %s trial %s recorded token streams but the verifier reported no score; the step will fail if --custom-rm-path trains on the verifier score.",
-                task_id, trial.trial_name,
+                task_id,
+                trial.trial_name,
             )
     return trial
