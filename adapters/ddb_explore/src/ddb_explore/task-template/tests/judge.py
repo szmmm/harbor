@@ -685,7 +685,6 @@ class RubricJudge(ProbeAgent):
         rubric: dict[str, Any],
         *,
         device=None,
-        min_coverage: float = 0.9,
     ) -> dict[str, Any]:
         started = time.monotonic()
         self._deadline_at = started + self.deadline_s
@@ -797,7 +796,7 @@ class RubricJudge(ProbeAgent):
                 ]
             verdicts = {leaf_id: v["verdict"] for leaf_id, v in self.verdicts.items()}
             result = {
-                **score_tree(leaves, verdicts, min_coverage=min_coverage),
+                **score_tree(leaves, verdicts),
                 "finished_by_model": finished,
             }
             if result.get("score") is None:
@@ -815,7 +814,6 @@ class RubricJudge(ProbeAgent):
             scoring=SCORING,
             rubric_id=rubric.get("id"),
             rubric_hash=hashlib.sha256(task_json.encode()).hexdigest(),
-            min_coverage=min_coverage,
             summary=self.summary,
             leaves=[
                 {

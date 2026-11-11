@@ -60,10 +60,10 @@ leaves divided by the total weight of leaves with PASS or FAIL. A critical
 failure does not force the reward to zero. Branches only group leaves.
 
 UNKNOWN leaves have no verdict. A critical leaf without a verdict makes the
-score unavailable. So does coverage (leaves with PASS or FAIL, divided by all
-leaves) below `VLM_RUBRIC_MIN_COVERAGE` (0.9 by default). These checks also
-apply when a critical leaf fails. UNKNOWN (called UNTESTED in generated
-tasks) leaves are excluded from the weighted denominator.
+score unavailable, including when another critical leaf fails. Coverage
+(leaves with PASS or FAIL, divided by all leaves) is diagnostic only and has
+no minimum requirement. UNKNOWN (called UNTESTED in generated tasks) leaves
+are excluded from the weighted denominator.
 
 `reward.json` has `reward`, the enabled components (`vlm_reward`,
 `trajectory_reward`), and diagnostics that the slime bridge logs but does not
@@ -77,7 +77,6 @@ train on: `vlm_coverage`, `vlm_pass_rate` (unweighted),
 | `VLM_EXPLORE_MAX_STEPS` | 40 | Model turns with browser tools. A turn can call several tools. |
 | `VLM_EXPLORE_DEADLINE_S` | 1500 | Wall time after which the judge stops testing and records its verdicts. |
 | `VLM_REQUEST_TIMEOUT_S` | 120 | Timeout of one model request. |
-| `VLM_RUBRIC_MIN_COVERAGE` | 0.9 | Least coverage for a score. |
 
 `test.sh` stops the judge after 1800 s. `verifier.timeout_sec` is 3600 s.
 

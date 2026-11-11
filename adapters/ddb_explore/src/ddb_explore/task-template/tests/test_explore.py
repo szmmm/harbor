@@ -146,7 +146,6 @@ async def run_probe(
         omit_temperature=_truthy("VLM_OMIT_TEMPERATURE", "0"),
     )
     deadline_s = float(os.environ.get("VLM_EXPLORE_DEADLINE_S", "1500"))
-    min_coverage = float(os.environ.get("VLM_RUBRIC_MIN_COVERAGE", "0.9"))
     device_name = (
         os.environ.get("VLM_EXPLORE_DEVICE", "").strip() or app_spec["default_device"]
     )
@@ -171,7 +170,7 @@ async def run_probe(
                 deadline_s=deadline_s,
                 source_root=APP_DIR,
                 trace_sink=sink,
-            ).evaluate(app_url, rubric, device=device, min_coverage=min_coverage)
+            ).evaluate(app_url, rubric, device=device)
         finally:
             await env.stop()
     finally:

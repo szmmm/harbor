@@ -5,9 +5,9 @@ leaves have weight 1. A critical failure does not force the score to zero.
 Branches only group leaves; diagnostic pass rates remain unweighted.
 
 The judge can leave a leaf UNKNOWN when it could not reach the check. Such a
-leaf has no verdict. A critical leaf without a verdict, or coverage below
-``min_coverage``, makes the score unavailable: a missing measurement must not
-become a training reward. The weighted pass rate uses leaves with a verdict.
+leaf has no verdict. A critical leaf without a verdict makes the score
+unavailable. Coverage is diagnostic only; the weighted pass rate uses leaves
+with a verdict.
 """
 
 from __future__ import annotations
@@ -54,8 +54,6 @@ def flatten(tree: dict[str, Any]) -> list[dict[str, Any]]:
 def score_tree(
     leaves: list[dict[str, Any]],
     verdicts: dict[str, str],
-    *,
-    min_coverage: float,
 ) -> dict[str, Any]:
     """``verdicts`` maps leaf id to PASS, FAIL or UNKNOWN; absent means UNKNOWN."""
     resolved = {
@@ -109,13 +107,6 @@ def score_tree(
             "status": "incomplete",
             "score": None,
             "error": f"Critical leaves without a verdict: {unresolved_critical}",
-        }
-    if coverage < min_coverage:
-        return {
-            **result,
-            "status": "incomplete",
-            "score": None,
-            "error": f"Coverage {coverage:.2f} is below {min_coverage:.2f}",
         }
     return {
         **result,

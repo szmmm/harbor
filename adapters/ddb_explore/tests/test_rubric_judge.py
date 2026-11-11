@@ -132,9 +132,7 @@ def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
 
 
 def test_score_weights_critical_leaves_twice():
-    result = score_tree(
-        LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"}, min_coverage=1
-    )
+    result = score_tree(LEAVES, {i: "PASS" for i in IDS} | {"S.1.2": "FAIL"})
     assert result["status"] == "completed"
     assert result["score"] == pytest.approx(5 / 6)
     assert result["pass_rate"] == pytest.approx(4 / 5)
@@ -142,25 +140,24 @@ def test_score_weights_critical_leaves_twice():
     assert result["branches"]["content"] is None
 
 
-def test_failed_critical_leaf_does_not_bypass_coverage():
-    result = score_tree(LEAVES, {"I.1": "FAIL"}, min_coverage=0.9)
+def test_failed_critical_leaf_scores_at_low_coverage():
+    result = score_tree(LEAVES, {"I.1": "FAIL"})
     assert (result["status"], result["score"], result["failed_critical"]) == (
-        "incomplete",
-        None,
+        "completed",
+        0.0,
         ["I.1"],
     )
 
 
 def test_unknown_critical_leaf_has_no_score():
     verdicts = {i: "PASS" for i in IDS} | {"I.1": "UNKNOWN"}
-    result = score_tree(LEAVES, verdicts, min_coverage=0)
+    result = score_tree(LEAVES, verdicts)
     assert result["status"] == "incomplete" and result["score"] is None
 
 
-def test_low_coverage_has_no_score_and_enough_coverage_scores_resolved_leaves():
+def test_low_coverage_scores_resolved_leaves():
     verdicts = {"I.1": "PASS", "S.1.1": "PASS", "S.1.2": "FAIL", "D.B.1": "PASS"}
-    assert score_tree(LEAVES, verdicts, min_coverage=0.9)["score"] is None
-    result = score_tree(LEAVES, verdicts, min_coverage=0.8)
+    result = score_tree(LEAVES, verdicts)
     assert result["score"] == pytest.approx(4 / 5)
     assert result["counts"] == {"PASS": 3, "FAIL": 1, "UNKNOWN": 1}
 
@@ -434,7 +431,7 @@ def verdict(leaf_id, value, *evidence):
     }
 
 
-def run_judge(tmp_path, script, *, max_steps=6, min_coverage=0.9):
+def run_judge(tmp_path, script, *, max_steps=6):
     client = FakeClient(script)
     (tmp_path / "workspace").mkdir(exist_ok=True)
     (tmp_path / "workspace/index.html").write_text(
@@ -450,9 +447,7 @@ def run_judge(tmp_path, script, *, max_steps=6, min_coverage=0.9):
         inspector=FakeInspector(),
     )
     judge._make_client = lambda: client
-    result = asyncio.run(
-        judge.evaluate("http://app", RUBRIC, min_coverage=min_coverage)
-    )
+    result = asyncio.run(judge.evaluate("http://app", RUBRIC))
     return result, client
 
 
@@ -550,7 +545,7 @@ def test_judge_forces_verdicts_when_budget_ends(tmp_path):
             )
         ],
     ]
-    result, client = run_judge(tmp_path, script, max_steps=2, min_coverage=0.8)
+    result, client = run_judge(tmp_path, script, max_steps=2)
     final = client.requests[-1]
     assert final["tool_choice"]["function"]["name"] == "record_verdicts"
     assert [t["function"]["name"] for t in final["tools"]] == ["record_verdicts"]
