@@ -968,6 +968,7 @@ class DDB(BaseAgent):
             "interaction_mode": "auto",  # Auto mode answers ask_question interactions itself; a headless trial must never block waiting for a human.
             "skip_rewriter": False,
             "screenshot": False,
+            "effort_mode": "high",
             "callback_url": callback_url,
             "callback_secret": callback_secret,
         }
