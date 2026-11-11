@@ -543,6 +543,70 @@ def test_judge_without_verdicts_has_no_score(tmp_path):
     assert result["status"] == "evaluator_failed" and result["score"] is None
 
 
+@pytest.mark.parametrize(
+    "recorded,provider_fails,expected",
+    [(len(IDS), False, 0), (len(IDS) - 1, False, None), (len(IDS), True, None)],
+)
+def test_completed_unknown_assessment(
+    tmp_path, monkeypatch, recorded, provider_fails, expected
+):
+    monkeypatch.setenv("VLM_REWARD_ENABLED", "1")
+    monkeypatch.setenv("TRAJECTORY_REWARD_ENABLED", "0")
+    ending = (
+        RuntimeError("provider failed")
+        if provider_fails
+        else [("finish", {"summary": "Unassessable"})]
+    )
+    result, _ = run_judge(
+        tmp_path,
+        [
+            [
+                (
+                    "record_verdicts",
+                    {"verdicts": [verdict(i, "UNKNOWN") for i in IDS[:recorded]]},
+                )
+            ],
+            ending,
+        ],
+    )
+    assert result["score"] == expected
+    assert all(leaf["verdict"] == "UNKNOWN" for leaf in result["leaves"])
+    if expected is None:
+        assert result["status"] == "evaluator_failed"
+        with pytest.raises(ValueError):
+            combine_rewards.build_rewards(result, {})
+    else:
+        assert result["status"] == "completed" and result["finished_by_model"]
+        assert result["scoring_status"] == "all_unknown"
+        assert result["counts"] == {"PASS": 0, "FAIL": 0, "UNKNOWN": len(IDS)}
+        assert result["coverage"] == 0 and result["failed_critical"] == []
+        assert combine_rewards.build_rewards(result, {})["reward"] == 0
+
+
+@pytest.mark.parametrize("explicit_runtime_state", [False, True])
+def test_deferred_delivery_requires_explicit_platform_evidence(explicit_runtime_state):
+    from judge import _judge_handoff
+
+    handoff = {
+        "execution": {"status": "completed"},
+        "build": {"mode": "none", "success": True},
+        "source_transfer": {
+            "complete": True,
+            "inventory_source": "deferred",
+            "files_downloaded": 0,
+            "inventory_complete": False,
+        },
+    }
+    if explicit_runtime_state:
+        handoff["build"].update(skipped=True, runtime_state="deferred")
+    original = json.loads(json.dumps(handoff))
+    context = _judge_handoff(handoff)
+    assert (
+        "No application artifact was materialized" in context["build"]["meaning"]
+    ) is explicit_runtime_state
+    assert handoff == original
+
+
 def test_old_observations_keep_text_and_limit_images(tmp_path):
     script = [[("take_screenshot", {})] for _ in range(7)]
     _, client = run_judge(tmp_path, script, max_steps=7)
@@ -831,7 +895,10 @@ def test_shared_deadline_does_not_grant_extra_finalization_time(tmp_path, monkey
         return result
 
     monkeypatch.setattr(FakeClient, "create", create)
-    result, client = run_judge(tmp_path, [[("click_ref", {"ref": 0})]])
+    result, client = run_judge(
+        tmp_path,
+        [[("record_verdicts", {"verdicts": [verdict(i, "UNKNOWN") for i in IDS]})]],
+    )
     assert result["status"] == "evaluator_failed" and result["score"] is None
     assert len(client.requests) == 1
 

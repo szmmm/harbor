@@ -4,10 +4,12 @@ The score is the weighted pass rate: critical leaves have weight 2 and other
 leaves have weight 1. A critical failure does not force the score to zero.
 Branches only group leaves; diagnostic pass rates remain unweighted.
 
-A completed judge assessment with at least one PASS/FAIL receives a score.
-Unassessed leaves retain their diagnostic verdict and earn no credit: the
-weighted denominator includes every rubric leaf. An unresolved critical check
-does not suppress the reward. No usable verdicts still means no score.
+A completed judge assessment receives a score when it has a PASS/FAIL or an
+explicit UNKNOWN verdict for every leaf. UNKNOWN earns no credit without being
+relabeled FAIL; all leaves remain in the weighted denominator. An all-UNKNOWN
+assessment scores zero with a distinct diagnostic status. Missing assessments
+without any PASS/FAIL still have no score; evaluator failures are handled by the
+caller and must not be converted into an all-UNKNOWN assessment.
 """
 
 from __future__ import annotations
@@ -97,16 +99,23 @@ def score_tree(
             for verdict in VERDICTS
         },
     }
-    if not resolved:
+    all_unknown = all(verdicts.get(leaf["id"]) == "UNKNOWN" for leaf in leaves)
+    if not resolved and not all_unknown:
         return {
             **result,
             "status": "incomplete",
             "score": None,
-            "error": "No PASS or FAIL verdicts were recorded",
+            "error": "No PASS/FAIL verdicts and the UNKNOWN assessment is incomplete",
         }
     return {
         **result,
         "status": "completed",
         "score": passed_weight / total_weight if total_weight else None,
-        "scoring_status": "complete" if len(resolved) == len(leaves) else "partial",
+        "scoring_status": (
+            "all_unknown"
+            if all_unknown
+            else "complete"
+            if len(resolved) == len(leaves)
+            else "partial"
+        ),
     }

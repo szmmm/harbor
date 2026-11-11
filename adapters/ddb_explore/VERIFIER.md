@@ -56,7 +56,7 @@ overall deadline.
 
 ## Scoring
 
-`rubric_score.py` uses `rubric-tree-v2`: critical leaves have weight 2 and
+`rubric_score.py` uses `rubric-tree-v3`: critical leaves have weight 2 and
 other leaves weight 1. Reward is PASS weight divided by the weight of **all**
 rubric leaves. Fully assessed scores are unchanged. Unassessed leaves earn no
 credit but retain UNKNOWN, rather than being
@@ -64,11 +64,18 @@ rewritten to FAIL. Coverage, branch pass rates and unresolved critical IDs remai
 diagnostic; partial assessments have `scoring_status: partial`.
 
 A normally completed judge evaluation with at least one accepted PASS/FAIL can
-produce a reward even when critical checks remain unresolved. An assessment
-with no usable verdicts, a judge/API error, or an exhausted deadline still has
-no reward. This deliberately prioritizes usable conservative training rewards:
-a preview outage may lower the score, and a few source-only passes cannot inflate
-an otherwise untested app to a perfect score.
+produce a reward even when critical checks remain unresolved. A completed
+assessment with an explicit UNKNOWN verdict for every leaf also receives zero,
+with `scoring_status: all_unknown`, zero coverage, and unchanged UNKNOWN verdicts.
+This is zero earned credit, not a claim that every requirement failed. It applies
+after normal completion or successful finalization; a missing assessment without
+any PASS/FAIL, a transfer failure, judge/API error, or exhausted deadline still
+has no reward. Merely calling `finish` without recording assessments is insufficient.
+
+This is the v3 change from v2's requirement for at least one PASS/FAIL. It deliberately
+prioritizes usable conservative training rewards: an unassessable delivery, including
+one obscured by a preview-service outage, may receive zero. Diagnostics retain that
+uncertainty; training must not interpret the reward as confirmed actor fault.
 
 `reward.json` has `reward`, the enabled components (`vlm_reward`,
 `trajectory_reward`), and diagnostics that the slime bridge logs but does not
@@ -216,7 +223,13 @@ The same rubric judge receives execution, actor claims, build outcome, preview
 readiness and source-transfer diagnostics. The judge-facing build context renames
 `success` to `platform_reported_success` and explains the mode: `live` confirms
 only a runtime/session, and `none` means the build was skipped. Neither verifies
-compilation or HTTP readiness. Raw handoff values remain in the audit report.
+compilation or HTTP readiness. Harbor also preserves the build event's `skipped`
+and `runtime_state` fields. For a completed execution, an explicitly deferred runtime,
+skipped `none` build, and completed zero-file transfer from the deferred workspace
+establish that no application artifact was materialized for this delivery. The
+judge-facing build meaning states this platform evidence without treating ordinary
+missing files or legacy handoffs as proof of absence. Raw handoff values remain in
+the audit report.
 Initial readiness errors have unknown attribution, not an infrastructure label.
 The canonical and generated prompts use the same verdict names and policy: proven blockers fail dependent requirements;
 missing observations or evaluator capabilities remain unassessed. Failed tool
@@ -236,7 +249,7 @@ not an enforced tool budget. When readiness fails, available
 root `package.json` and `.deepdiver/artifact.json` are supplied as cited source
 observations before the first judge call, so nested app manifests do not obscure
 the actual startup configuration. Uncertain infrastructure failures
-may still remain UNKNOWN. Configured budgets are unchanged; partial scoring follows the v2 rule above.
+may still remain UNKNOWN. Configured budgets are unchanged; partial scoring follows the v3 rule above.
 
 No dependency installation is needed to read source. Harbor retains app source,
 artifact declarations, package manifests, lockfiles, vendored source, assets,

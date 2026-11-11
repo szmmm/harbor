@@ -70,6 +70,8 @@ def make_handoff(
         },
         "build": {
             "mode": build.get("mode"),
+            "skipped": build.get("skipped"),
+            "runtime_state": build.get("runtime_state"),
             "success": build.get("success"),
             "error": safe_detail(build.get("error"), secret),
         },

@@ -28,7 +28,7 @@ from probe import _PROBE_TOOLS, ProbeAgent, _device_block, _fn, _temperature_rej
 from rubric_score import VERDICTS, flatten, score_tree
 from source_tools import SourceTree
 
-SCORING = "rubric-tree-v2"
+SCORING = "rubric-tree-v3"
 ACTION_NAMES = {
     "click_ref",
     "click_at",
@@ -121,8 +121,9 @@ finish, record each leaf, including UNKNOWN where appropriate. finish ends the
 evaluation immediately. A completed assessment can receive a partial score with
 unresolved critical leaves: PASS earns its weight, and all leaves remain in the
 denominator (critical weight 2, others 1). UNKNOWN earns no credit without being
-relabeled FAIL. An assessment with no supported PASS or FAIL has no score; an
-evidence-supported zero is valid. Choose verdicts from evidence, not score impact.
+relabeled FAIL. If every leaf is explicitly UNKNOWN, a completed assessment earns
+zero credit without asserting that the app failed. Missing assessments and judge
+execution failures have no score. Choose verdicts from evidence, not score impact.
 
 Browser and source tools:
 - Use references from the latest accessibility snapshot. It lists interactive
@@ -296,6 +297,24 @@ def _judge_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
             "Platform-reported build status; inspect current "
             "code and diagnostics before attributing a preview failure.",
         )
+        transfer = context.get("source_transfer") or {}
+        if (
+            context.get("execution", {}).get("status") == "completed"
+            and build.get("mode") == "none"
+            and build.get("skipped") is True
+            and build.get("runtime_state") == "deferred"
+            and transfer.get("complete") is True
+            and transfer.get("inventory_source") == "deferred"
+            and transfer.get("files_downloaded") == 0
+        ):
+            build["meaning"] = (
+                "The platform explicitly reports an unmaterialized runtime and a "
+                "skipped build; the completed transfer also reports a deferred "
+                "workspace with zero files. No application artifact was materialized "
+                "for this delivery. This is delivery-state evidence, not an inference "
+                "from missing files in a filtered or incomplete source export. "
+                "Assess which rubric requirements depend on that absent artifact."
+            )
         context["build"] = build
     return context
 

@@ -254,6 +254,25 @@ def test_handoff_contains_separate_outcomes_without_secrets():
     assert result["build"]["error"] == "Syntax error"
     assert result["actor_claim"]["completion_status"] is None
     assert "SECRET" not in json.dumps(result) and "token=x" not in json.dumps(result)
+    deferred = make_handoff(
+        {
+            "status": "completed",
+            "events": [
+                {
+                    "type": "build_complete",
+                    "data": {
+                        "mode": "none",
+                        "success": True,
+                        "skipped": True,
+                        "runtime_state": "deferred",
+                    },
+                }
+            ],
+        },
+        receipt({}),
+    )
+    assert deferred["build"]["skipped"] is True
+    assert deferred["build"]["runtime_state"] == "deferred"
 
 
 def test_sandbox_hashes_checked_before_judging(tmp_path):
