@@ -227,9 +227,9 @@ read source in chunks and search. Positive code evidence can support a verdict
 for a failed app, while uncertain omissions remain UNKNOWN/UNTESTED. Source
 cannot prove visual or interactive success. The prompt uses general evidence
 rules rather than a separate failure workflow or delivery-specific verdict recipes.
-It asks for at most three preview recovery actions without meaningful progress
-before assessing available evidence and finishing;
-this is model guidance, not a hard tool budget. When readiness fails, available
+It asks the judge to stop repeating recovery attempts that reveal no new
+information, assess the available evidence, and leave time to record verdicts.
+This is model guidance, not a fixed retry count or a hard tool budget. When readiness fails, available
 root `package.json` and `.deepdiver/artifact.json` are supplied as cited source
 observations before the first judge call, so nested app manifests do not obscure
 the actual startup configuration. Uncertain infrastructure failures
