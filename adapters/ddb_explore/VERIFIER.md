@@ -50,9 +50,9 @@ context, and only the 3 most recent screenshots. Older ones keep their IDs.
 All of them are saved under `evidence/`.
 
 `finish` ends the evaluation immediately, with no finalization afterward.
-Critical failures do not stop exploration. When the turn limit ends first,
-the judge gets a forced verdict call and one repair call within the same
-overall deadline.
+Critical failures do not stop exploration. When the turn limit or exploration
+budget ends first, or a timeout/browser crash interrupts exploration, the judge
+gets a forced verdict call and one repair call within the same overall deadline.
 
 ## Scoring
 
@@ -69,7 +69,7 @@ assessment with an explicit UNKNOWN verdict for every leaf also receives zero,
 with `scoring_status: all_unknown`, zero coverage, and unchanged UNKNOWN verdicts.
 This is zero earned credit, not a claim that every requirement failed. It applies
 after normal completion or successful finalization; a missing assessment without
-any PASS/FAIL, a transfer failure, judge/API error, or exhausted deadline still
+any PASS/FAIL, a transfer failure, unrecovered judge/API error, or exhausted overall deadline still
 has no reward. Merely calling `finish` without recording assessments is insufficient.
 
 This is the v3 change from v2's requirement for at least one PASS/FAIL. It deliberately
@@ -87,7 +87,7 @@ train on: `vlm_coverage`, `vlm_pass_rate` (unweighted),
 | Variable | Default | Meaning |
 |---|---|---|
 | `VLM_EXPLORE_MAX_STEPS` | 40 | Model turns with browser tools. A turn can call several tools. |
-| `VLM_EXPLORE_DEADLINE_S` | 1500 | Wall time after which the judge stops testing and records its verdicts. |
+| `VLM_EXPLORE_DEADLINE_S` | 1500 | Overall judge deadline, including finalization. Up to 300 s (at most one third) is reserved for finalization. |
 | `VLM_REQUEST_TIMEOUT_S` | 120 | Timeout of one model request. |
 
 `test.sh` stops the judge after 1800 s. `verifier.timeout_sec` is 3600 s.
@@ -166,16 +166,30 @@ changed by this transport update.
 further tools or model requests execute after it. The scorer then evaluates
 the recorded verdicts; an unusable score fails the evaluation run.
 
-Only exhaustion of the exploration turn limit triggers forced finalization:
+Exhaustion of the exploration turn limit or exploration budget, an exhausted
+model-request timeout, or a browser crash triggers forced finalization:
 one `record_verdicts` round for pending/UNKNOWN leaves, with one repair round
 for missing or rejected entries. Finalization uses existing evidence only and
 caps each response at 16,384 tokens (or the lower configured output limit).
 UNKNOWN is valid when evidence remains insufficient. Accepted PASS/FAIL leaves
 are not automatically reconsidered. Critical FAIL never forces termination.
 
-Exploration and finalization share the original overall deadline. There is no
-reserved time split and no deadline extension. Request retries remain bounded;
-an exhausted exploration request timeout fails evaluation. If finalization
+Exploration and finalization share the original overall deadline, with no
+extension. The judge reserves `min(300 seconds, deadline / 3)` for finalization:
+with the default 1500-second budget, exploration stops at 1200 seconds. Model
+requests, retry waits, navigation and browser observations respect the exploration
+cutoff. Request retries remain bounded; an exhausted exploration timeout switches
+to finalization using the saved observations and verdicts.
+
+Browser crashes reported as tool errors or exceptions are retained as failed
+observations even when the preview initially loaded successfully. Remaining
+browser calls in the same response are recorded as skipped, then the judge
+finalizes without using the browser. This retains a complete tool-response
+history and the existing evidence IDs, text, screenshots and accepted verdicts.
+The finalization prompt distinguishes judge/browser failures from proven app
+defects. Reports and traces include the exploration stop reason and error.
+
+If finalization
 cannot complete within the shared deadline, or the scorer cannot produce a
 usable score, the evaluation fails with no reward. Evidence and recorded
 verdicts remain available for diagnosis.

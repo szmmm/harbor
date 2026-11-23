@@ -76,7 +76,14 @@ def load_results(job_dir: Path, datasets_dir: Path) -> dict:
         result = json.loads((trial_dir / "result.json").read_text())
         # task_name uses "ddb-rubrics/000001" (org/name format).
         # The task directory uses dashes, so replace "/" with "-".
-        task_name = result.get("task_name", "").replace("/", "-")
+        task_path = result.get("config", {}).get("task", {}).get("path") or result.get(
+            "task_id", {}
+        ).get("path")
+        task_name = (
+            Path(task_path).name
+            if task_path
+            else result.get("task_name", "").replace("/", "-")
+        )
 
         # Locate the dataset task for category info
         dataset_task_dir = datasets_dir / task_name

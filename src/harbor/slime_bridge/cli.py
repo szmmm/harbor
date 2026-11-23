@@ -203,6 +203,26 @@ def build_app(
     return app
 
 
+class _TrialDebugFilter(logging.Filter):
+    """Leave trial debug records in their file, retaining unsaved diagnostics."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.INFO or not record.name.startswith(
+            "harbor.utils.logger.harbor.trial.trial."
+        ):
+            return True
+        source = logging.getLogger(record.name)
+        while source is not None:
+            if any(
+                isinstance(handler, logging.FileHandler)
+                and handler.level <= record.levelno
+                for handler in source.handlers
+            ):
+                return False
+            source = source.parent
+        return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
@@ -227,6 +247,12 @@ def main() -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.log_level.upper() != "DEBUG":
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(
+                handler, logging.FileHandler
+            ):
+                handler.addFilter(_TrialDebugFilter())
 
     config = HarborConfig.from_env(
         dataset_dir=args.dataset_dir,

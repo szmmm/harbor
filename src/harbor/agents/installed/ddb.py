@@ -782,7 +782,9 @@ class DDB(BaseAgent):
                     assistant_turn[k] = turn[k]
             if len(assistant_turn) > 1:
                 trajectories[agent_id]["messages"].append(assistant_turn)
-        for agent_id in trajectories:
+        for agent_id in (
+            trajectories if os.environ.get("TRAJECTORY_REWARD_ENABLED", "1") != "0" else {}
+        ):
             trajectory_scores[agent_id] = get_trajectory_score(
                 trajectories[agent_id]["messages"],
                 self.trajectory_score_type,

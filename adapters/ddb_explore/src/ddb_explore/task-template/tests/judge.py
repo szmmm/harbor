@@ -48,6 +48,7 @@ ACTION_NAMES = {
 KEEP_IMAGES = 3
 FINAL_TURNS = 2
 FINAL_MAX_TOKENS = 16384
+FINAL_RESERVE_S = 300.0
 
 SYSTEM_PROMPT = """You test an app against a rubric of yes/no checks.
 The rubric was written for the user's request before the app was built.
@@ -384,6 +385,7 @@ class RubricJudge(ProbeAgent):
         self.request_retries = 0
         self._observations: list[dict] = []
         self.preview_error: str | None = None
+        self._exploration_error: str | None = None
 
     async def _observe(self, action: str, args: dict, outcome: dict) -> list[dict]:
         snap = await self._inspector.interactive_snapshot(self._snapshot_args())
@@ -572,6 +574,10 @@ class RubricJudge(ProbeAgent):
         retries = max(0, int(os.environ.get("VLM_REQUEST_RETRIES", "2")))
         retry_delay = max(0.0, float(os.environ.get("VLM_RETRY_DELAY_S", "5")))
         deadline = getattr(self, "_deadline_at", time.monotonic() + self.deadline_s)
+        if not getattr(self, "_finalizing", False):
+            deadline = min(
+                deadline, getattr(self, "_exploration_deadline_at", deadline)
+            )
         attempt, transient_failures = 0, 0
         while True:
             remaining = deadline - time.monotonic()
@@ -590,8 +596,9 @@ class RubricJudge(ProbeAgent):
                 }
             )
             try:
-                response = await asyncio.to_thread(
-                    client.chat.completions.create, **request
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(client.chat.completions.create, **request),
+                    timeout=request["timeout"],
                 )
                 break
             except Exception as exc:
@@ -600,7 +607,7 @@ class RubricJudge(ProbeAgent):
                     request.pop("temperature")
                     continue
                 status = getattr(exc, "status_code", None)
-                transient = isinstance(exc, APIConnectionError) or (
+                transient = isinstance(exc, (APIConnectionError, TimeoutError)) or (
                     isinstance(exc, APIStatusError)
                     and (exc.status_code in {408, 429} or exc.status_code >= 500)
                 )
@@ -746,25 +753,50 @@ class RubricJudge(ProbeAgent):
                     reply = f"Done. See observation {self.evidence[-1]['id']}."
                 elif name in BROWSER_NAMES:
                     try:
-                        if name == "take_screenshot":
-                            outcome = {"success": True}
-                        elif name in {
-                            "set_viewport",
-                            "set_media",
-                            "clear_site_data",
-                            "return_to_app",
-                            "click_at",
-                            "open_app",
-                            "list_tabs",
-                            "switch_tab",
-                        }:
-                            outcome = await self._page_tool(name, args)
-                        else:
-                            outcome = await self._dispatch(name, args)
-                        observations.extend(await self._observe(name, args, outcome))
-                    except Exception as exc:
-                        if self.preview_error is None:
-                            raise
+                        if self._exploration_error:
+                            raise RuntimeError(
+                                "Browser action skipped after exploration was interrupted"
+                            )
+                        async with asyncio.timeout(
+                            max(0, self._exploration_deadline_at - time.monotonic())
+                        ):
+                            if name == "take_screenshot":
+                                outcome = {"success": True}
+                            elif name in {
+                                "set_viewport",
+                                "set_media",
+                                "clear_site_data",
+                                "return_to_app",
+                                "click_at",
+                                "open_app",
+                                "list_tabs",
+                                "switch_tab",
+                            }:
+                                outcome = await self._page_tool(name, args)
+                            else:
+                                outcome = await self._dispatch(name, args)
+                            observations.extend(
+                                await self._observe(name, args, outcome)
+                            )
+                        # Some browser tools return a failed result instead of raising.
+                        record = self.evidence[-1]
+                        for failure in (outcome, record.get("snapshot") or {}):
+                            error = str(failure.get("error") or "")
+                            if _browser_crashed(error):
+                                self._exploration_error = _safe_preview_error(
+                                    RuntimeError(error)
+                                )
+                    except (ValueError, TypeError, KeyError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - preserve browser transport failures for finalization
+                        if (
+                            self.preview_error is None
+                            or isinstance(exc, TimeoutError)
+                            or _browser_crashed(str(exc))
+                        ):
+                            self._exploration_error = (
+                                self._exploration_error or _safe_preview_error(exc)
+                            )
                         observations.extend(
                             self._observe_source(
                                 name,
@@ -803,6 +835,10 @@ class RubricJudge(ProbeAgent):
     ) -> dict[str, Any]:
         started = time.monotonic()
         self._deadline_at = started + self.deadline_s
+        reserve_s = min(FINAL_RESERVE_S, self.deadline_s / 3)
+        self._exploration_deadline_at = self._deadline_at - reserve_s
+        self._exploration_error = None
+        stop_reason = "turn_limit"
         self._finalizing = False
         self._app_url = app_url
         self.preview_error = preview_error
@@ -858,8 +894,11 @@ class RubricJudge(ProbeAgent):
             try:
                 if not app_url:
                     raise ValueError("No preview URL was published")
-                await self._env.goto(app_url)
-                initial = await self._observe("open", {}, {"success": True})
+                async with asyncio.timeout(
+                    max(0, self._exploration_deadline_at - time.monotonic())
+                ):
+                    await self._env.goto(app_url)
+                    initial = await self._observe("open", {}, {"success": True})
             except Exception as exc:  # noqa: BLE001 - a navigation failure must still reach the judge
                 self.preview_error = self.preview_error or _safe_preview_error(exc)
                 initial = self._observe_source(
@@ -923,8 +962,9 @@ class RubricJudge(ProbeAgent):
                 )
             finished, step = False, 0
             for step in range(self._cfg.max_steps):
-                if time.monotonic() >= self._deadline_at:
-                    raise TimeoutError("Judge deadline exhausted during exploration")
+                if time.monotonic() >= self._exploration_deadline_at:
+                    stop_reason = "exploration_deadline"
+                    break
                 messages.append(
                     {
                         "role": "user",
@@ -933,8 +973,19 @@ class RubricJudge(ProbeAgent):
                         ),
                     }
                 )
-                if await self._turn(client, messages, leaves, by_id, step, final=False):
-                    finished = True
+                try:
+                    finished = await self._turn(
+                        client, messages, leaves, by_id, step, final=False
+                    )
+                except (TimeoutError, APITimeoutError) as exc:
+                    self._exploration_error = _safe_preview_error(exc)
+                    stop_reason = "request_timeout"
+                    break
+                if finished:
+                    stop_reason = "finished"
+                    break
+                if self._exploration_error:
+                    stop_reason = "browser_error"
                     break
             self._finalizing = True
             targets = [
@@ -949,6 +1000,8 @@ class RubricJudge(ProbeAgent):
                     {
                         "kind": "finalization_start",
                         "targets": targets,
+                        "reason": stop_reason,
+                        "exploration_error": self._exploration_error,
                         "budget_seconds": max(0, self._deadline_at - time.monotonic()),
                     }
                 )
@@ -959,6 +1012,13 @@ class RubricJudge(ProbeAgent):
                     {
                         "role": "user",
                         "content": self._verdict_table(leaves, 0)
+                        + f"\nExploration stopped: {stop_reason}."
+                        + (
+                            f" Diagnostic: {self._exploration_error}. A judge or browser "
+                            "failure alone is not proof of an app defect."
+                            if self._exploration_error
+                            else ""
+                        )
                         + "\nExploration has ended. Use only existing evidence. Record a "
                         "verdict for EVERY listed leaf; revisit earlier UNKNOWN verdicts. "
                         "Use UNKNOWN when evidence remains insufficient. Keep reasons concise. "
@@ -1004,6 +1064,9 @@ class RubricJudge(ProbeAgent):
             client.close()
         result.update(
             scoring=SCORING,
+            exploration_stop_reason=stop_reason,
+            exploration_error=self._exploration_error,
+            finalization_reserve_s=reserve_s,
             preview_readiness_error=self.preview_error,
             handoff=handoff,
             rubric_id=rubric.get("id"),
@@ -1036,6 +1099,18 @@ class RubricJudge(ProbeAgent):
             {"kind": "evaluation", **{k: v for k, v in result.items() if k != "leaves"}}
         )
         return result
+
+
+def _browser_crashed(error: str) -> bool:
+    return any(
+        marker in error.lower()
+        for marker in (
+            "target crashed",
+            "page crashed",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+        )
+    )
 
 
 def _safe_preview_error(exc: Exception) -> str:

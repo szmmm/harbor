@@ -128,7 +128,13 @@ def test_judge_retry_budget_is_finite(tmp_path, monkeypatch):
     error = APITimeoutError(request=httpx.Request("POST", "http://judge"))
     result, client = run_judge(tmp_path, [error, error, error])
     assert result["status"] == "evaluator_failed" and result["score"] is None
-    assert len(client.requests) == 3 and result["request_retries"] == 2
+    assert len(client.requests) == 3 + FINAL_TURNS
+    assert result["request_retries"] == 2
+    assert all(request["tool_choice"] == "auto" for request in client.requests[:3])
+    assert all(
+        request["tool_choice"]["function"]["name"] == "record_verdicts"
+        for request in client.requests[3:]
+    )
 
 
 @pytest.mark.skipif(
@@ -815,7 +821,7 @@ def test_coordinate_click_and_persistence_tools(tmp_path, monkeypatch):
     assert result["leaves"][-1]["verdict"] == "PASS"
 
 
-def test_exploration_timeout_fails_without_finalization(tmp_path, monkeypatch):
+def test_exploration_timeout_finalizes_saved_evidence(tmp_path, monkeypatch):
     import httpx
     from openai import APITimeoutError
 
@@ -825,10 +831,19 @@ def test_exploration_timeout_fails_without_finalization(tmp_path, monkeypatch):
         [
             [("click_ref", {"ref": 0})],
             APITimeoutError(request=httpx.Request("POST", "http://judge")),
+            [
+                (
+                    "record_verdicts",
+                    {"verdicts": [verdict(i, "PASS", "e0001") for i in IDS]},
+                )
+            ],
         ],
     )
-    assert result["status"] == "evaluator_failed" and result["score"] is None
-    assert len(client.requests) == 2
+    assert result["status"] == "completed" and result["score"] == 1
+    assert result["exploration_stop_reason"] == "request_timeout"
+    assert len(result["evidence"]) == 2
+    assert len(client.requests) == 3
+    assert client.requests[-1]["tool_choice"]["function"]["name"] == "record_verdicts"
 
 
 def test_finish_ends_immediately_without_finalization(tmp_path):

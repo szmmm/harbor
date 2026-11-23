@@ -285,7 +285,6 @@ class WebGenBenchAdapter:
         }
         ui_instruct_json = json.dumps(ui_data, indent=2) + "\n"
         (task_paths.tests_dir / "ui_instruct.json").write_text(ui_instruct_json)
-        (task_paths.environment_dir / "ui_instruct.json").write_text(ui_instruct_json)
 
     def _write_task_config(
         self, task_paths: TaskPaths, record: WebGenBenchTask
