@@ -100,33 +100,37 @@ def install_preview_guard(driver_task, entry_url: str):
                     next.pathname !== entry.pathname ||
                     next.search !== entry.search;
             }};
-            const block = (value) => {{
+            const block = (value, source) => {{
                 if (!escapes(value)) return false;
                 const next = new URL(value, location.href);
-                window.__harborPreviewEscape = next.pathname;
+                window.__harborPreviewEscape = {{
+                    path: next.pathname,
+                    source,
+                    sameOrigin: next.origin === entry.origin,
+                }};
                 return true;
             }};
             for (const method of ['pushState', 'replaceState']) {{
                 const original = history[method].bind(history);
                 history[method] = (state, unused, url) =>
-                    url != null && block(url) ? undefined : original(state, unused, url);
+                    url != null && block(url, method) ? undefined : original(state, unused, url);
             }}
             document.addEventListener('click', (event) => {{
                 const anchor = event.target.closest?.('a[href]');
-                if (anchor && block(anchor.href)) {{
+                if (anchor && block(anchor.href, 'link')) {{
                     event.preventDefault();
                     event.stopImmediatePropagation();
                 }}
             }}, true);
             document.addEventListener('submit', (event) => {{
-                if (block(event.target.action)) {{
+                if (block(event.target.action, 'form')) {{
                     event.preventDefault();
                     event.stopImmediatePropagation();
                 }}
             }}, true);
             const originalOpen = window.open.bind(window);
             window.open = (url, ...args) =>
-                url != null && block(url) ? null : originalOpen(url, ...args);
+                url != null && block(url, 'window.open') ? null : originalOpen(url, ...args);
         }})();
     """
     driver_task.execute_cdp_cmd(
@@ -136,7 +140,7 @@ def install_preview_guard(driver_task, entry_url: str):
 
 
 def preview_escape(driver_task, entry):
-    """Return the escaped location, or None while the preview scope is intact."""
+    """Return the attempted path and its source, if the guard observed one."""
     if entry is None:
         return None
     attempted_path = driver_task.execute_script(
@@ -152,22 +156,30 @@ def preview_escape(driver_task, entry):
         entry.path,
         entry.query,
     ):
-        return current_url
+        return {"path": current.path, "source": "navigation", "sameOrigin": False}
     return None
 
 
 def stop_on_preview_escape(driver_task, entry, messages):
     """Stop the actor before it can interact with a page outside the preview."""
-    escaped_url = preview_escape(driver_task, entry)
-    if not escaped_url:
+    escape = preview_escape(driver_task, entry)
+    if escape is None:
         return False
-    logging.error("Actor routing error: preview navigation escaped to %s", escaped_url)
+    if escape["sameOrigin"]:
+        reason = "Model output routing bug"
+    else:
+        reason = "Preview routing error"
+    logging.error(
+        "%s: preview navigation escaped to %s (%s)",
+        reason,
+        escape["path"],
+        escape["source"],
+    )
     messages.append(
         {
             "role": "assistant",
             "content": (
-                "Thought: The actor used the wrong router or path and "
-                "tried to leave the DDB preview. "
+                f"Thought: {reason}. Navigation left the DDB preview scope.\n"
                 "Action: ANSWER; [NO]"
             ),
         }

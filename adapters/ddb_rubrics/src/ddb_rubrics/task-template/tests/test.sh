@@ -30,6 +30,10 @@ fi
 run_vlm() {
     VLM_REWARD_PATH="$vlm_reward_path" python3 -u /tests/test_ui.py 2>&1
     local code=$?
+    # EX_CONFIG (78) marks a missing or unusable preview. Preserve the failure.
+    if [ "$code" -eq 78 ]; then
+        exit "$code"
+    fi
     if [ ! -s "$vlm_reward_path" ]; then
         echo "WARNING: VLM reward was not written; defaulting to 0"
         echo 0 > "$vlm_reward_path"

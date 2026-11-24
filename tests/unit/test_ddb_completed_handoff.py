@@ -13,14 +13,13 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from harbor.agents.installed.ddb import DDB, _prune_workspace
-from harbor.agents.installed.ddb_handoff import (
+from harbor.agents.ddb_handoff import (
     WorkspaceTransferError,
     download_complete_workspace,
-    execution_completed,
     extract_workspace_archive,
     make_handoff,
 )
+from harbor.agents.installed.ddb import DDB
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "adapters/ddb_explore/src/ddb_explore/task-template/tests"
@@ -46,21 +45,9 @@ def receipt(files):
 
 
 @pytest.mark.parametrize(
-    "status,success,accepted",
-    [
-        ("completed", False, True),
-        ("failed", True, False),
-    ],
+    ("status", "success"), [("completed", False), ("failed", True)]
 )
-def test_admission_uses_execution_completion(status, success, accepted):
-    assert (
-        execution_completed({"status": status, "result": {"success": success}})
-        is accepted
-    )
-
-
-def test_completed_build_failure_finishes_agent_phase(tmp_path, monkeypatch):
-    success = False
+def test_admission_uses_execution_completion(tmp_path, monkeypatch, status, success):
     from harbor.agents.installed import ddb
 
     agent = object.__new__(DDB)
@@ -86,7 +73,7 @@ def test_completed_build_failure_finishes_agent_phase(tmp_path, monkeypatch):
     agent.submit_task = AsyncMock(return_value={"task_id": "task", "app_id": "app"})
     agent.wait_for_webhook = AsyncMock(
         return_value={
-            "status": "completed",
+            "status": status,
             "result": {"success": success},
             "events": [
                 {
@@ -96,6 +83,7 @@ def test_completed_build_failure_finishes_agent_phase(tmp_path, monkeypatch):
             ],
         }
     )
+    agent._capture_failure = AsyncMock(return_value={"error": "Task failed"})
     agent.push_data_to_sandbox = AsyncMock()
     agent._abandon = AsyncMock()
     uploaded = []
@@ -105,6 +93,15 @@ def test_completed_build_failure_finishes_agent_phase(tmp_path, monkeypatch):
 
     env = SimpleNamespace(upload_file=upload)
     context = SimpleNamespace(metadata={})
+    if status == "failed":
+        with pytest.raises(RuntimeError, match="Task failed"):
+            asyncio.run(agent.run("Build an app", env, context))
+        agent.push_data_to_sandbox.assert_not_awaited()
+        agent._abandon.assert_awaited_once()
+        assert len(uploaded) == 1
+        assert uploaded[0][1]["source_transfer"]["complete"] is False
+        return
+
     asyncio.run(agent.run("Build an app", env, context))
     agent.push_data_to_sandbox.assert_awaited_once()
     agent._abandon.assert_not_awaited()
@@ -329,9 +326,12 @@ def test_existing_api_supplements_hidden_product_directories(tmp_path):
     def respond(request):
         requests.append(request)
         assert not request.url.path.endswith("/verification-tree")
-        return httpx.Response(
-            200, json={"source": "live", "files": roots[request.url.params["path"]]}
-        )
+        prefix = request.url.params["path"]
+        if prefix in ("", "dist") and sum(
+            r.url.params["path"] == prefix for r in requests
+        ) == 2:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"source": "live", "files": roots[prefix]})
 
     async def read(client, url, path, *, source=None):
         reads.append(path)
@@ -352,6 +352,8 @@ def test_existing_api_supplements_hidden_product_directories(tmp_path):
     assert result["complete"] is True and result["inventory_complete"] is False
     assert result["files_downloaded"] == 4
     assert reads.count("dist/assets/main.js") == 2
+    for prefix in ("", "dist"):
+        assert sum(r.url.params["path"] == prefix for r in requests) == 3
     for path, content in files.items():
         assert (tmp_path / path).read_bytes() == content
 
@@ -413,6 +415,7 @@ def test_archive_keeps_product_paths_and_excludes_dependencies(tmp_path, compres
         "site/.deepdiver/artifact.json": b"{}",
         "site/build/app.js": b"script",
         "site/node_modules/react/index.js": b"dependency",
+        "site/.next/cache/0.pack": b"intermediate",
     }
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode="w") as archive:
@@ -429,6 +432,7 @@ def test_archive_keeps_product_paths_and_excludes_dependencies(tmp_path, compres
     assert (tmp_path / "site/dist/index.html").read_bytes() == b"product"
     assert not (tmp_path / "dist").exists()  # No speculative wrapper stripping.
     assert not (tmp_path / "site/node_modules").exists()
+    assert not (tmp_path / "site/.next").exists()
 
 
 def test_existing_live_read_does_not_accept_snapshot_substitution(tmp_path):
@@ -580,14 +584,3 @@ def test_file_pull_skips_next_build_files_before_reading_and_keeps_assets(tmp_pa
     for path, content in files.items():
         assert (tmp_path / path).read_bytes() == content
     assert not (tmp_path / ".next").exists()
-
-
-def test_archive_prune_removes_next_intermediates_but_keeps_built_app(tmp_path):
-    for path in [".next/cache/webpack/0.pack", "out/index.html", "public/logo.png"]:
-        dest = tmp_path / path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"content")
-    _prune_workspace(tmp_path)
-    assert not (tmp_path / ".next").exists()
-    assert (tmp_path / "out/index.html").exists()
-    assert (tmp_path / "public/logo.png").exists()

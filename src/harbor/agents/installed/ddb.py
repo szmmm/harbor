@@ -53,20 +53,17 @@ import tarfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
 from typing import Any, override
 from urllib.parse import urlsplit
 
 import httpx
-import zstandard
 
 from harbor.agents.base import BaseAgent
-from harbor.agents.installed.ddb_handoff import (
+from harbor.agents.ddb_handoff import (
     WorkspaceTransferError,
     download_complete_workspace,
-    execution_completed,
     extract_workspace_archive,
     make_handoff,
 )
@@ -105,8 +102,6 @@ PREVIEW_URL_SANDBOX_PATH = "/tmp/harbor_preview_url"
 SOURCE_CODES_SANDBOX_PATH = "/tmp/DDB_App_source_codes.txt"
 TRAJECTORY_SANDBOX_PATH = "/tmp/harbor_trajectory.json"
 WORKSPACE_SANDBOX_PATH = "/app/workspace"
-# Keep application sources/assets; Next.js build intermediates are disposable.
-WORKSPACE_EXCLUDE_PATTERN = r"^\.git/|^node_modules/|^tool_call_logs/|^\.next/"
 
 
 logger: logging.Logger = global_logger.getChild(__name__)
@@ -413,14 +408,6 @@ async def _release_listener() -> None:
     await listener.stop()
 
 
-def _iter_file_paths(nodes: list[dict[str, Any]] | None) -> Iterator[str]:
-    """Walk DDB's file-listing tree, yielding the path of every file node."""
-    for node in nodes or []:
-        if node.get("type") == "file":
-            yield node["path"]
-        yield from _iter_file_paths(node.get("children"))
-
-
 def _decode_workspace_content(payload: dict[str, Any], path: str) -> bytes:
     """Decode explicit API encodings; detect legacy Base64 gzip archives only."""
     content = payload.get("content")
@@ -446,54 +433,6 @@ def _decode_workspace_content(payload: dict[str, Any], path: str) -> bytes:
         except (ValueError, binascii.Error, tarfile.TarError, EOFError, OSError):
             pass
     return content.encode("utf-8")
-
-
-def _unpack_workspace_archive(archive: bytes, dest: Path) -> None:
-    """Extract DDB's ``.tar.zst`` workspace snapshot into ``dest``.
-
-    ``zstandard`` only reaches harbor as a transitive dependency, so it is
-    imported here: a runtime without it falls back to the per-file pull instead
-    of failing to import the agent. ``filter="data"`` drops absolute paths,
-    ``..`` components and non-regular members, so a hostile archive cannot
-    write outside ``dest``.
-    """
-    dest.mkdir(parents=True, exist_ok=True)
-    with zstandard.ZstdDecompressor().stream_reader(BytesIO(archive)) as reader:
-        with tarfile.open(fileobj=reader, mode="r|") as tar:
-            tar.extractall(dest, filter="data")
-
-
-def _strip_single_root(dest: Path) -> None:
-    """Lift a workspace packaged under one top-level directory up into ``dest``.
-
-    DDB may package the snapshot either way; a web app always has files at its
-    root (``package.json``, ``index.html``, ...), so a tree whose only entry is
-    a directory is a wrapper, and leaving it in place would put the sources one
-    level below where the verifier looks for them.
-    """
-    entries = list(dest.iterdir())
-    if len(entries) != 1 or not entries[0].is_dir() or entries[0].is_symlink():
-        return
-    root = entries[0]
-    for entry in list(root.iterdir()):
-        shutil.move(str(entry), str(dest / entry.name))
-    root.rmdir()
-    logger.debug(
-        f"Stripped the wrapper directory {root.name}/ from the DDB workspace archive"
-    )
-
-
-def _prune_workspace(dest: Path) -> None:
-    """Drop ``WORKSPACE_EXCLUDE_PATTERN`` matches from an extracted workspace."""
-    exclude = re.compile(WORKSPACE_EXCLUDE_PATTERN)
-    for entry in dest.iterdir():
-        is_dir = entry.is_dir() and not entry.is_symlink()
-        if not exclude.search(entry.name + "/" if is_dir else entry.name):
-            continue
-        if is_dir:
-            shutil.rmtree(entry, ignore_errors=True)
-        else:
-            entry.unlink(missing_ok=True)
 
 
 class DDB(BaseAgent):
@@ -872,7 +811,8 @@ class DDB(BaseAgent):
                     success = (
                         result.get("success") if isinstance(result, dict) else False
                     )
-                    if not execution_completed(task):
+                    # Grade completed executions even when DDB reports a build failure.
+                    if task.get("status") != "completed":
                         failure = await self._capture_failure(task, session_id)
                         context.metadata["ddb_failure"] = failure
                         error = failure["error"]

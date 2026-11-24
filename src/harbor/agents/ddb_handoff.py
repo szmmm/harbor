@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import re
 import tarfile
 from io import BytesIO
@@ -29,11 +30,6 @@ EXCLUDED_PATHS = {".deepdiver/skills", ".deepdiver/api_catalog"}
 
 class WorkspaceTransferError(RuntimeError):
     """Infrastructure failed to provide a complete, stable source export."""
-
-
-def execution_completed(task: dict[str, Any]) -> bool:
-    # API lifecycle status, not the actor's self-reported task_done claim.
-    return bool(task.get("status") == "completed")
 
 
 def safe_detail(value, secret: str = "") -> str:
@@ -233,7 +229,7 @@ async def download_complete_workspace(
 ) -> dict[str, Any]:
     """Finish all advertised downloads; explicitly qualify upstream completeness."""
 
-    async def listing(path=""):
+    async def listing(path: str = "") -> tuple[list[str], str]:
         response = await client.get(
             files_url,
             params={"path": path, "max_depth": max_depth, "mode": "edit"},
@@ -284,18 +280,22 @@ async def download_complete_workspace(
     pending = set(targets)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def fetch(path):
+    async def download_file(path: str) -> bool:
+        try:
+            content = await read_file(client, files_url, path, source=source)
+        except (httpx.HTTPError, ValueError, TypeError, OSError):
+            return False
+        if content is None:
+            return False
+        destination = root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        return True
+
+    async def fetch(path: str) -> None:
         async with semaphore:
-            try:
-                content = await read_file(client, files_url, path, source=source)
-            except (httpx.HTTPError, ValueError, TypeError, OSError):
-                content = None
-            if content is None:
-                return
-            destination = root / path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-            pending.remove(path)
+            if await download_file(path):
+                pending.remove(path)
 
     for attempt in range(attempts):
         async with asyncio.TaskGroup() as group:
@@ -313,28 +313,34 @@ async def download_complete_workspace(
     # Failure of this unadvertised probe is diagnostic, never proof of absence.
     artifact = ".deepdiver/artifact.json"
     if source in {"live", "snapshot"} and artifact not in targets:
-        content = None
         for attempt in range(attempts):
-            try:
-                content = await read_file(client, files_url, artifact, source=source)
-            except (httpx.HTTPError, ValueError, TypeError, OSError):
-                content = None
-            if content is not None:
+            if await download_file(artifact):
                 break
             if attempt + 1 < attempts:
                 await asyncio.sleep(retry_delay)
-        if content is not None:
-            destination = root / artifact
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
         else:
             unavailable.append(artifact)
 
-    final_files, final_source = await listing()
+    async def recheck_inventory(path: str = "") -> tuple[list[str], str]:
+        for attempt in range(1, attempts + 1):
+            try:
+                return await listing(path)
+            except httpx.HTTPError as exc:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                    if status not in (408, 429) and not 500 <= status < 600:
+                        raise
+                if attempt == attempts:
+                    raise
+                # Jitter keeps concurrent trials from retrying in lockstep.
+                await asyncio.sleep(retry_delay * (attempt + random.random()))
+        raise ValueError("Inventory recheck requires at least one attempt")
+
+    final_files, final_source = await recheck_inventory()
     if final_files != files or final_source != source:
         raise WorkspaceTransferError("Source inventory changed during download")
     for prefix, extra in supplements.items():
-        final_extra, final_source = await listing(prefix)
+        final_extra, final_source = await recheck_inventory(prefix)
         if final_extra != extra or final_source != source:
             raise WorkspaceTransferError("Supplement inventory changed during download")
     return workspace_receipt(root, source, unavailable=sorted(unavailable))
