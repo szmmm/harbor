@@ -11,15 +11,16 @@ import os
 import re
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
 from browser_env import PlaywrightEnv, resolve_device
+from dist_preview import LocalDistError, remote_preview_url, serve_dist
 from handoff import load_handoff
 from judge import RubricJudge
-from local_app import start_local_app
 from probe import ProbeConfig
 
 APP_SPEC_PATH = Path("/tests/app_spec.json")
@@ -28,7 +29,6 @@ APP_DIR = Path("/app/workspace")
 REPORT_PATH = Path("/logs/verifier/explore-report.json")
 TRACE_PATH = Path("/logs/verifier/explore.trace.jsonl")
 APP_READY_TIMEOUT = float(os.environ.get("APP_READY_TIMEOUT", "120"))
-DEV_SERVER_STARTUP_TIMEOUT = 60.0
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -86,17 +86,6 @@ def _write_report(report: dict[str, Any]) -> None:
     REPORT_PATH.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
-    )
-
-
-def start_dev_server():
-    """Retained for future local verification; main currently uses previews only."""
-    return start_local_app(
-        APP_DIR,
-        REPORT_PATH.parent / "local-app.log",
-        wait_for_app_ready,
-        startup_timeout=DEV_SERVER_STARTUP_TIMEOUT,
-        install_timeout=float(os.environ.get("APP_INSTALL_TIMEOUT", "300")),
     )
 
 
@@ -257,31 +246,61 @@ def main() -> int:
             }
         )
         return 1
-    app_url = os.environ.get("APP_BASE_URL", "").strip()
-    preview_error = (
-        wait_for_app_ready(app_url, APP_READY_TIMEOUT)
-        if app_url
-        else "APP_BASE_URL is not set; a remote preview URL is required"
-    )
-    try:
-        report = asyncio.run(
-            run_probe(
-                app_url, app_spec, rubric, preview_error=preview_error, handoff=handoff
+    with ExitStack() as stack:
+        local_error = None
+        preview_error = None
+        try:
+            app_url = stack.enter_context(serve_dist(APP_DIR / "dist"))
+        except LocalDistError as exc:
+            local_error = str(exc)
+            app_url = remote_preview_url()
+            if app_url:
+                execution_source = "remote_preview"
+                preview_error = wait_for_app_ready(app_url, APP_READY_TIMEOUT)
+                if preview_error:
+                    preview_error = f"Local dist could not be served ({local_error}). {preview_error}"
+            else:
+                execution_source = "unavailable"
+                preview_error = (
+                    f"Local dist could not be served ({local_error}) and no remote "
+                    "preview URL was available."
+                )
+        else:
+            execution_source = "local_dist"
+
+        if handoff is not None or local_error:
+            handoff = {
+                **(handoff or {}),
+                "verification": {
+                    "execution_source": execution_source,
+                    "local_dist_error": local_error,
+                    "preview_readiness_error": preview_error,
+                },
+            }
+        print(f"=== Exploratory app source: {execution_source} ===")
+        try:
+            report = asyncio.run(
+                run_probe(
+                    app_url,
+                    app_spec,
+                    rubric,
+                    preview_error=preview_error,
+                    handoff=handoff,
+                )
             )
-        )
-    except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
-        report = {
-            "status": "evaluator_failed",
-            "scoring": "disabled",
-            "error": re.sub(
-                r"https?://[^\s<>\"']+",
-                "<URL redacted>",
-                f"{type(exc).__name__}: {exc}",
-            ),
-            "findings": [],
-            "trace_path": str(TRACE_PATH),
-        }
-    report["execution_source"] = "remote_preview"
+        except Exception as exc:  # noqa: BLE001 - persist arbitrary judge failures
+            report = {
+                "status": "evaluator_failed",
+                "scoring": "disabled",
+                "error": re.sub(
+                    r"https?://[^\s<>\"']+",
+                    "<URL redacted>",
+                    f"{type(exc).__name__}: {exc}",
+                ),
+                "findings": [],
+                "trace_path": str(TRACE_PATH),
+            }
+    report["execution_source"] = execution_source
     report.setdefault("preview_readiness_error", preview_error)
     report["handoff"] = handoff
     _write_report(report)

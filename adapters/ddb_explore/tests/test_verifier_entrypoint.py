@@ -1,5 +1,6 @@
 """Verify reward switches without browsers or model calls."""
 
+import asyncio
 import json
 import os
 import subprocess
@@ -108,17 +109,32 @@ def test_trace_retains_new_observations_when_old_table_is_removed(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "url,readiness_error",
-    [("http://preview", "HTTP 202: not ready"), ("", None), ("http://preview", None)],
+    "has_dist,url,readiness_error,source",
+    [
+        (True, "http://preview", None, "local_dist"),
+        (False, "http://preview", None, "remote_preview"),
+        (False, "http://preview", "HTTP 202: not ready", "remote_preview"),
+        (False, "", None, "unavailable"),
+    ],
 )
-def test_readiness_reaches_normal_probe_without_local_fallback(
-    tmp_path, monkeypatch, url, readiness_error
+def test_app_source_and_readiness_reach_judge(
+    tmp_path, monkeypatch, has_dist, url, readiness_error, source
 ):
+    from urllib.request import urlopen
+
+    import dist_preview
     import test_explore as explore
 
     monkeypatch.setenv("VLM_API_KEY", "test")
     monkeypatch.setenv("APP_BASE_URL", url)
     monkeypatch.setenv("VLM_EXPLORE_ENABLED", "1")
+    monkeypatch.setattr(dist_preview, "PREVIEW_URL_PATH", tmp_path / "preview_url")
+    app = tmp_path / "workspace"
+    if has_dist:
+        (app / "dist").mkdir(parents=True)
+        (app / "dist/index.html").write_text("<h1>Local build</h1>")
+    monkeypatch.setattr(explore, "APP_DIR", app)
+    monkeypatch.setattr(explore, "load_handoff", lambda _: {"schema_version": 1})
     spec = tmp_path / "app_spec.json"
     rubric = tmp_path / "rubric.json"
     spec.write_text('{"default_device":"desktop"}')
@@ -126,21 +142,41 @@ def test_readiness_reaches_normal_probe_without_local_fallback(
     monkeypatch.setattr(explore, "APP_SPEC_PATH", spec)
     monkeypatch.setattr(explore, "RUBRIC_PATH", rubric)
     monkeypatch.setattr(explore, "REPORT_PATH", tmp_path / "report.json")
-    monkeypatch.setattr(explore, "wait_for_app_ready", lambda *args: readiness_error)
-    monkeypatch.setattr(
-        explore, "start_dev_server", lambda: pytest.fail("Local fallback must not run")
-    )
+    readiness_calls = []
+
+    def check_readiness(app_url, timeout):
+        readiness_calls.append(app_url)
+        return readiness_error
+
+    monkeypatch.setattr(explore, "wait_for_app_ready", check_readiness)
     calls = []
 
+    def read_page(app_url):
+        with urlopen(app_url, timeout=3) as response:
+            return response.read()
+
     async def run_probe(app_url, app_spec, rubric, *, preview_error=None, handoff=None):
-        calls.append((app_url, preview_error))
+        if has_dist:
+            assert (
+                await asyncio.to_thread(read_page, app_url) == b"<h1>Local build</h1>"
+            )
+        calls.append((app_url, preview_error, handoff))
         return {"status": "completed", "score": 0}
 
     monkeypatch.setattr(explore, "run_probe", run_probe)
     assert explore.main() == 0
-    assert len(calls) == 1 and calls[0][0] == url
-    assert bool(calls[0][1]) is bool(not url or readiness_error)
-    assert (
-        json.loads(explore.REPORT_PATH.read_text())["preview_readiness_error"]
-        == calls[0][1]
-    )
+    [(app_url, error, handoff)] = calls
+    if has_dist:
+        assert app_url.startswith("http://127.0.0.1:")
+    else:
+        assert app_url == url
+    assert readiness_calls == ([url] if source == "remote_preview" else [])
+    assert bool(error) is bool(not url or readiness_error)
+    assert handoff["verification"] == {
+        "execution_source": source,
+        "local_dist_error": None if has_dist else "dist/index.html is missing",
+        "preview_readiness_error": error,
+    }
+    report = json.loads(explore.REPORT_PATH.read_text())
+    assert report["execution_source"] == source
+    assert report["preview_readiness_error"] == error
