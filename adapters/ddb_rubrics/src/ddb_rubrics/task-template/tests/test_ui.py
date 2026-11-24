@@ -2,16 +2,15 @@
 """
 WebGen-Bench UI test runner using WebVoyager (Selenium + VLM).
 
-Reads /tests/ui_instruct.json, starts the app's dev server (npm run dev /
-npm run start), then invokes the WebVoyager agent against each ui_instruct
-task.  Scoring follows the original compute_acc.py logic:
+Reads /tests/ui_instruct.json and runs WebVoyager against an app served at
+APP_BASE_URL. The staged oracle can start its reference app from /app.
+Scoring follows the original compute_acc.py logic:
   YES = 1.0, PARTIAL = 0.5, NO / missing = 0.0
 Final VLM reward = sum(scores) / total_tasks. The caller can select its output
 path with VLM_REWARD_PATH.
 
-If the dev server fails to start within the timeout, reward=0 is written and
-the script exits without running WebVoyager.  compute_acc.py will then treat
-all UI tests for this task as start_failed (Path 3: no verifier output).
+Local verification of downloaded DDB workspaces requires a separate runtime
+and is currently unavailable. Missing previews fail without a VLM reward.
 
 Required environment variables (pass via --ae in harbor run):
   VLM_REWARD_PATH    - Optional component reward output path
@@ -31,12 +30,14 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 UI_INSTRUCT_PATH = Path("/tests/ui_instruct.json")
 APP_DIR = Path("/app")
+ORACLE_SOURCE_DIR = Path("/solution/app")
 REWARD_PATH = Path(os.environ.get("VLM_REWARD_PATH", "/logs/verifier/reward.txt"))
 WEBVOYAGER_DIR = Path("/tests/webvoyager")
 WORK_DIR = Path("/tmp/webvoyager_work")
@@ -72,8 +73,16 @@ At the end of your testing, answer only with one of the following:
 """
 
 
+class LocalVerificationNotImplementedError(NotImplementedError):
+    """The DDB workspace cannot be run locally by this verifier."""
+
+
+class PreviewReadinessError(RuntimeError):
+    """The published app failed to become available for verification."""
+
+
 def start_dev_server() -> tuple[subprocess.Popen, str] | None:
-    """Start the app's npm dev server; return (process, base_url) or None on failure.
+    """Start the staged oracle app; return (process, base_url) or None on failure.
 
     Matches the fork's start_service.py behaviour:
       1. npm install
@@ -81,8 +90,8 @@ def start_dev_server() -> tuple[subprocess.Popen, str] | None:
       3. Wait up to DEV_SERVER_STARTUP_TIMEOUT seconds for a localhost URL in stdout
     """
     package_json = APP_DIR / "package.json"
-    if not package_json.exists():
-        print("ERROR: No package.json found — app cannot be started")
+    if not package_json.is_file():
+        print(f"ERROR: No package.json found in {APP_DIR} — oracle app cannot be started")
         return None
 
     try:
@@ -100,17 +109,17 @@ def start_dev_server() -> tuple[subprocess.Popen, str] | None:
         print("ERROR: No 'dev' or 'start' script in package.json")
         return None
 
-    print("=== Running npm install ===")
+    print(f"=== Running npm install in {APP_DIR} ===")
     subprocess.run(
         ["npm", "install"],
-        cwd=str(APP_DIR),
+        cwd=APP_DIR,
         check=False,
     )
 
     print(f"=== Starting dev server: {' '.join(start_cmd)} ===")
     proc = subprocess.Popen(
         start_cmd,
-        cwd=str(APP_DIR),
+        cwd=APP_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -171,7 +180,7 @@ def _find_empty_asset(page_url: str, html: str) -> str | None:
     return None
 
 
-def wait_for_app_ready(url: str, timeout: float) -> bool:
+def wait_for_app_ready(url: str, timeout: float) -> None:
     """Poll a remote app URL until it serves real content, up to ``timeout``s.
 
     Remote previews (e.g. DeepDiver) may still be finishing their post-run
@@ -179,8 +188,7 @@ def wait_for_app_ready(url: str, timeout: float) -> bool:
     self-refreshing placeholder page (identified by its ``__deepdiver_ready``
     poll hook / "Finalizing your app" copy). Judging that page yields all-NO
     scores for an app that is seconds from ready, so wait for real content
-    first. Returns False on timeout; the caller proceeds anyway and the judge
-    scores whatever the URL serves — never worse than not having waited.
+    first. A failed publish or a readiness timeout prevents verification.
     """
     deadline = time.monotonic() + timeout
     attempt = 0
@@ -194,15 +202,26 @@ def wait_for_app_ready(url: str, timeout: float) -> bool:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 status = resp.status
                 body = resp.read(65536).decode("utf-8", errors="replace")
-        except Exception as e:  # URLError, socket timeout, reset, ...
-            err = e
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            if status == 409:
+                with exc:
+                    body = exc.read(65536).decode("utf-8", errors="replace")
+                if '<meta name="dd-preview-placeholder" content="failed"' in body:
+                    raise PreviewReadinessError(
+                        "DDB preview publish failed (HTTP 409). The draft did not build."
+                    ) from exc
+            else:
+                exc.close()
+        except (OSError, ValueError) as exc:
+            err = exc
         placeholder = "__deepdiver_ready" in body or "Finalizing your app" in body
         empty_asset = None
         if status == 200 and body and not placeholder:
             empty_asset = _find_empty_asset(url, body)
             if empty_asset is None:
                 print(f"=== App URL ready (attempt {attempt}) ===")
-                return True
+                return
         if placeholder:
             reason = f"HTTP {status}, placeholder page"
         elif empty_asset is not None:
@@ -213,11 +232,9 @@ def wait_for_app_ready(url: str, timeout: float) -> bool:
             reason = f"HTTP {status}"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            print(
-                f"WARNING: app URL not ready after {timeout:.0f}s ({reason}); "
-                "proceeding anyway"
+            raise PreviewReadinessError(
+                f"App URL not ready after {timeout:.0f}s ({reason})."
             )
-            return False
         print(f"  waiting for app URL ({reason}); {remaining:.0f}s left")
         time.sleep(3)
 
@@ -446,6 +463,14 @@ def compute_score(data: dict) -> float:
 
 
 def main() -> None:
+    override_url = os.environ.get("APP_BASE_URL")
+    if not override_url and not ORACLE_SOURCE_DIR.is_dir():
+        raise LocalVerificationNotImplementedError(
+            "Local verification of downloaded DDB workspaces is not fully "
+            "implemented. DDB did not provide a preview URL, and APP_BASE_URL "
+            "is unset. A running app URL is required for WebGen verification."
+        )
+
     REWARD_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not UI_INSTRUCT_PATH.exists():
@@ -460,11 +485,6 @@ def main() -> None:
         REWARD_PATH.write_text("0\n")
         sys.exit(1)
 
-    # Optional override: point WebVoyager at an already-running app (e.g. a
-    # remote preview URL from a cloud agent) instead of booting one from /app.
-    # When APP_BASE_URL is unset, behaviour is unchanged — the app is started
-    # locally from /app exactly as before.
-    override_url = os.environ.get("APP_BASE_URL")
     if override_url:
         print(f"=== APP_BASE_URL set; skipping local dev server, using {override_url} ===")
         proc, base_url = None, override_url
@@ -503,4 +523,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (LocalVerificationNotImplementedError, PreviewReadinessError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(os.EX_CONFIG)
