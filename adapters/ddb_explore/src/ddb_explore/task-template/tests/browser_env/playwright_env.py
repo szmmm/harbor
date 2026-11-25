@@ -436,12 +436,7 @@ class PlaywrightEnv:
         try:
             req = route.request
             host = (urlparse(req.url).hostname or "").lower()
-            if (
-                self._preview_secret
-                and host
-                and host == self._preview_host
-                and host not in _DEV_HOSTS_BLOCKLIST
-            ):
+            if self._preview_secret and host and host == self._preview_host:
                 headers = dict(req.headers)
                 headers["x-preview-test"] = self._preview_secret
                 await route.continue_(headers=headers)

@@ -20,10 +20,17 @@ rm -f \
 
 echo "=== DDB Rubrics Test Runner (mode: $reward_mode) ==="
 
+# Use the preview URL published by DDB. A manual APP_BASE_URL wins.
+if [ -z "${APP_BASE_URL:-}" ] && [ -f /tmp/harbor_preview_url ]; then
+    APP_BASE_URL="$(cat /tmp/harbor_preview_url)"
+    export APP_BASE_URL
+    echo "=== Using agent-published preview URL: $APP_BASE_URL ==="
+fi
+
 run_vlm() {
     VLM_REWARD_PATH="$vlm_reward_path" python3 -u /tests/test_ui.py 2>&1
     local code=$?
-    # EX_CONFIG (78) means no app URL was usable. Preserve the failure.
+    # EX_CONFIG (78) marks a missing or unusable preview. Preserve the failure.
     if [ "$code" -eq 78 ]; then
         exit "$code"
     fi

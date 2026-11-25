@@ -2,12 +2,15 @@
 """
 WebGen-Bench UI test runner using WebVoyager (Selenium + VLM).
 
-Reads /tests/ui_instruct.json and runs WebVoyager against the downloaded
-DDB dist or a remote preview. The staged oracle can start its app from /app.
+Reads /tests/ui_instruct.json and runs WebVoyager against an app served at
+APP_BASE_URL. The staged oracle can start its reference app from /app.
 Scoring follows the original compute_acc.py logic:
   YES = 1.0, PARTIAL = 0.5, NO / missing = 0.0
 Final VLM reward = sum(scores) / total_tasks. The caller can select its output
 path with VLM_REWARD_PATH.
+
+Local verification of downloaded DDB workspaces requires a separate runtime
+and is currently unavailable. Missing previews fail without a VLM reward.
 
 Required environment variables (pass via --ae in harbor run):
   VLM_REWARD_PATH    - Optional component reward output path
@@ -30,21 +33,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import ExitStack
 from pathlib import Path
-
-from dist_preview import (
-    InvalidDistError,
-    LocalDistError,
-    remote_preview_url,
-    serve_dist,
-)
 
 UI_INSTRUCT_PATH = Path("/tests/ui_instruct.json")
 APP_DIR = Path("/app")
 ORACLE_SOURCE_DIR = Path("/solution/app")
-DIST_DIR = Path("/app/workspace/dist")
-TRANSFER_RECEIPT = Path("/tmp/harbor_workspace_transfer.json")
 REWARD_PATH = Path(os.environ.get("VLM_REWARD_PATH", "/logs/verifier/reward.txt"))
 WEBVOYAGER_DIR = Path("/tests/webvoyager")
 WORK_DIR = Path("/tmp/webvoyager_work")
@@ -80,6 +73,10 @@ At the end of your testing, answer only with one of the following:
 """
 
 
+class LocalVerificationNotImplementedError(NotImplementedError):
+    """The DDB workspace cannot be run locally by this verifier."""
+
+
 class PreviewReadinessError(RuntimeError):
     """The published app failed to become available for verification."""
 
@@ -94,14 +91,12 @@ def start_dev_server() -> tuple[subprocess.Popen, str] | None:
     """
     package_json = APP_DIR / "package.json"
     if not package_json.is_file():
-        print(
-            f"ERROR: No package.json found in {APP_DIR} — oracle app cannot be started"
-        )
+        print(f"ERROR: No package.json found in {APP_DIR} — oracle app cannot be started")
         return None
 
     try:
         pkg = json.loads(package_json.read_text())
-    except (OSError, ValueError) as e:
+    except Exception as e:
         print(f"ERROR: Failed to read package.json: {e}")
         return None
 
@@ -176,13 +171,11 @@ def _find_empty_asset(page_url: str, html: str) -> str | None:
     for ref in _PAGE_ASSET_RE.findall(html)[:5]:
         asset_url = urllib.parse.urljoin(page_url, ref)
         try:
-            req = urllib.request.Request(
-                asset_url, headers={"User-Agent": "webgen-bench-verifier"}
-            )
+            req = urllib.request.Request(asset_url, headers={"User-Agent": "webgen-bench-verifier"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status == 200 and not resp.read(1):
                     return ref
-        except (OSError, ValueError):
+        except Exception:
             return ref  # an unreachable bundle blanks the page just the same
     return None
 
@@ -469,64 +462,15 @@ def compute_score(data: dict) -> float:
     return final
 
 
-def workspace_download_complete() -> bool:
-    try:
-        receipt = json.loads(TRANSFER_RECEIPT.read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(receipt, dict) and receipt.get("complete") is True
-
-
-def stop_dev_server(proc: subprocess.Popen) -> None:
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
-
-def select_app_url(stack: ExitStack) -> str | None:
-    try:
-        url = stack.enter_context(serve_dist(DIST_DIR))
-    except LocalDistError as exc:
-        local_error = str(exc)
-        invalid_dist = isinstance(exc, InvalidDistError)
-    else:
-        print("=== Using local dist ===")
-        return url
-
-    fallback_url = remote_preview_url()
-    if fallback_url:
-        print(
-            f"=== Falling back to remote preview (local dist unavailable: {local_error}) ==="
-        )
-        wait_for_app_ready(fallback_url, APP_READY_TIMEOUT)
-        return fallback_url
-
-    if ORACLE_SOURCE_DIR.is_dir():
-        result = start_dev_server()
-        if result is None:
-            print("ERROR: Failed to start staged oracle dev server")
-            return None
-        proc, url = result
-        stack.callback(stop_dev_server, proc)
-        return url
-
-    if invalid_dist and workspace_download_complete():
-        print(
-            f"ERROR: No valid dist produced and no remote preview URL available ({local_error})"
-        )
-        return None
-
-    raise PreviewReadinessError(
-        f"Local dist could not be served ({local_error}) and no remote preview URL "
-        "is available"
-        + ("; workspace download was not confirmed complete" if invalid_dist else "")
-    )
-
-
 def main() -> None:
+    override_url = os.environ.get("APP_BASE_URL")
+    if not override_url and not ORACLE_SOURCE_DIR.is_dir():
+        raise LocalVerificationNotImplementedError(
+            "Local verification of downloaded DDB workspaces is not fully "
+            "implemented. DDB did not provide a preview URL, and APP_BASE_URL "
+            "is unset. A running app URL is required for WebGen verification."
+        )
+
     REWARD_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not UI_INSTRUCT_PATH.exists():
@@ -541,14 +485,32 @@ def main() -> None:
         REWARD_PATH.write_text("0\n")
         sys.exit(1)
 
-    with ExitStack() as stack:
-        base_url = select_app_url(stack)
-        if base_url is None:
+    if override_url:
+        print(f"=== APP_BASE_URL set; skipping local dev server, using {override_url} ===")
+        proc, base_url = None, override_url
+        wait_for_app_ready(base_url, APP_READY_TIMEOUT)
+    else:
+        result = start_dev_server()
+        if result is None:
+            # App failed to start — all UI tests will be marked start_failed by
+            # compute_acc.py (Path 3: no verifier output), matching the fork pipeline.
+            print(
+                "ERROR: Failed to start dev server — all UI tests will be marked start_failed"
+            )
             REWARD_PATH.write_text("0\n")
-            return
+            sys.exit(0)
+        proc, base_url = result
+    try:
         tasks_file = create_tasks_jsonl(data, base_url)
         run_webvoyager(tasks_file)
         score = compute_score(data)
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     # Copy WebVoyager results (screenshots + interact_messages) to /logs for inspection
     results_src = WORK_DIR / "results"
@@ -563,6 +525,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except PreviewReadinessError as exc:
+    except (LocalVerificationNotImplementedError, PreviewReadinessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(os.EX_CONFIG)
