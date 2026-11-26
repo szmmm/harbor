@@ -29,6 +29,7 @@ the two sides exchange is ``harbor.slime_bridge.trial.TrialRollout``.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from collections import Counter
@@ -81,6 +82,7 @@ class HarborConfig:
     jobs_dir: Path = Path("jobs")
     n_concurrent_trials: int = 4
     timeout_multiplier: float = 4.0
+    ddb_task_timeout_sec: float = 4500.0
 
     @classmethod
     def from_env(cls, **overrides: Any) -> HarborConfig:
@@ -99,6 +101,12 @@ class HarborConfig:
             or default_preview_base_url(backend_port),
             "trajectory_score_type": os.environ.get(
                 "TRAJECTORY_SCORE_TYPE", DEFAULT_TRAJECTORY_SCORE_TYPE
+            ),
+            "ddb_task_timeout_sec": float(
+                os.environ.get("DDB_TASK_TIMEOUT_SEC") or cls.ddb_task_timeout_sec
+            ),
+            "timeout_multiplier": float(
+                os.environ.get("HARBOR_TIMEOUT_MULTIPLIER") or cls.timeout_multiplier
             ),
             "code_review_eval": os.environ.get("CODE_REVIEW_EVAL", "1"),
             "code_review_issue_cap": float(
@@ -160,6 +168,12 @@ class HarborConfig:
                 f"Point --dataset-dir (or HARBOR_DATASET_DIR) at a directory of "
                 f"harbor task directories, one per task id in the prompt data."
             )
+        for name, value in (
+            ("DDB_TASK_TIMEOUT_SEC", self.ddb_task_timeout_sec),
+            ("HARBOR_TIMEOUT_MULTIPLIER", self.timeout_multiplier),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         if self.n_concurrent_trials < 1:
             raise ValueError(
                 f"n_concurrent_trials must be >= 1, got {self.n_concurrent_trials}"
@@ -244,11 +258,7 @@ class HarborRolloutClient:
                             "training": True,
                             "proxy_url": cfg.proxy_url,
                             "trajectory_score_type": cfg.trajectory_score_type,
-                            # Below harbor's agent-phase cap (task.toml timeout_sec
-                            # x timeout_multiplier, 1200 x 4 = 4800s for webgen-bench)
-                            # so DDB's own timeout fires first and abandons the task
-                            # with diagnostics instead of being cancelled mid-wait.
-                            "task_timeout_sec": 4500,
+                            "task_timeout_sec": cfg.ddb_task_timeout_sec,
                         },
                         # DDB reads these from AgentConfig.env (the CLI's --ae), not kwargs.
                         env={

@@ -19,7 +19,6 @@ import pytest
 from slime.utils.types import Sample
 
 from harbor.slime_bridge.convert import trial_to_samples
-from .test_convert import MAIN
 from harbor.slime_bridge.harbor_client import (
     HarborConfig,
     HarborRolloutClient,
@@ -28,6 +27,8 @@ from harbor.slime_bridge.harbor_client import (
     _to_trial_rollout,
 )
 from harbor.slime_bridge.reward import harbor_verifier_reward
+
+from .test_convert import MAIN
 
 #: One agent's entry in metadata["trajectories"], per harbor's
 #: agents/installed/ddb.py::_parse_record.  Recorded by harbor, deliberately not
@@ -477,12 +478,26 @@ def test_resolve_task_dir_rejects_dot_and_dotdot(tmp_path):
             client.resolve_task_dir(task_id)
 
 
-def test_agent_timeout_kwarg_stays_below_the_agent_phase_cap(tmp_path, monkeypatch):
-    """The bridge pins DDB's ``task_timeout_sec`` under harbor's agent-phase cap
-    (task.toml ``timeout_sec`` x ``timeout_multiplier``, 1200 x 4 = 4800s for
-    webgen-bench) so DDB times out first and abandons with diagnostics instead
-    of being cancelled mid-wait by harbor."""
+@pytest.mark.parametrize(
+    ("settings", "expected_ddb", "expected_multiplier"),
+    [
+        ({}, 4500.0, 4.0),
+        (
+            {"DDB_TASK_TIMEOUT_SEC": "9000", "HARBOR_TIMEOUT_MULTIPLIER": "8"},
+            9000.0,
+            8.0,
+        ),
+    ],
+)
+def test_job_uses_configured_timeouts(
+    tmp_path, monkeypatch, settings, expected_ddb, expected_multiplier
+):
     from harbor.slime_bridge import harbor_client as hc
+
+    for name in ("DDB_TASK_TIMEOUT_SEC", "HARBOR_TIMEOUT_MULTIPLIER"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
 
     (tmp_path / "task-a").mkdir()
     captured = {}
@@ -497,12 +512,22 @@ def test_agent_timeout_kwarg_stays_below_the_agent_phase_cap(tmp_path, monkeypat
 
     monkeypatch.setattr(hc, "Job", SimpleNamespace(create=fake_create))
 
-    client = make_client(tmp_path)
-    asyncio.run(client.run(["task-a"]))
+    cfg = HarborConfig.from_env(
+        dataset_dir=tmp_path,
+        proxy_url="http://proxy",
+        ddb_base_url="http://ddb",
+        ddb_api_key="test",
+        ddb_preview_base_url="http://preview",
+        vlm_api_base_url="http://judge",
+        vlm_api_key="test",
+        vlm_model="test",
+    )
+    asyncio.run(HarborRolloutClient(cfg).run(["task-a"]))
 
-    agent = captured["config"].agents[0]
-    assert agent.kwargs["task_timeout_sec"] == 4500
-    assert agent.kwargs["task_timeout_sec"] < 1200 * client.config.timeout_multiplier
+    job = captured["config"]
+    assert job.agents[0].kwargs["task_timeout_sec"] == expected_ddb
+    assert job.timeout_multiplier == expected_multiplier
+
 
 @pytest.mark.parametrize("disable", [False, True])
 def test_job_verification_is_opt_in_disabled(monkeypatch, tmp_path, disable):

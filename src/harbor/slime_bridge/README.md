@@ -28,6 +28,7 @@ python train_harbor.py \
 
 * `--custom-rm-path` is **required** and picks the training signal: `harbor_verifier_reward` trains on the VLM judge's score for the built app, `harbor_trajectory_reward` on harbor's per-agent trajectory score (under the default `validation` type, `max(1000 - errors, 0)`). See §0.
 * Dataset, jobs dir, model name, concurrency and timeouts are configured on the **service** — they are not `--harbor-*` flags. `--harbor-service-url` is required.
+* Set `DDB_TASK_TIMEOUT_SEC` and `HARBOR_TIMEOUT_MULTIPLIER` in the service environment. Keep the DDB timeout below the task’s `[agent].timeout_sec` multiplied by the Harbor multiplier to give DDB time to cancel and collect diagnostics. The service’s `--timeout-multiplier` flag takes precedence over the environment value.
 * `--harbor-*` flags need a parser hook that slime's stock `train.py` does not install. Use a four-line entry point beside it (`train_harbor.py` on the GPU node):
 
   ```python
