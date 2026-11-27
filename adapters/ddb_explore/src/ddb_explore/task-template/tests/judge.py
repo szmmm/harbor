@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError
+from pdf_page import render_pdf_page
 from probe import _PROBE_TOOLS, ProbeAgent, _device_block, _fn, _temperature_rejected
 from rubric_score import VERDICTS, flatten, score_tree
 from source_tools import SourceTree
@@ -67,8 +68,10 @@ for a particular design. verify_by indicates the evidence to look for:
 - fact: inspect the relevant values or content and assess their correctness.
   The user's today is user_today; freshness words apply at evaluation_date.
 For requirements about the code, framework, dependencies, files or algorithms,
-inspect the relevant source. Source can establish these facts without a working
-preview, but cannot establish rendered appearance or successful interaction.
+inspect the relevant source and credit what the actor wrote. For visual checks,
+open the relevant page or file as a user would and cite a screenshot showing
+the detail you assessed. For a downloaded PDF, use render_download_page to
+inspect the relevant page.
 
 Verdicts:
 - PASS: the evidence shows that the requirement is met.
@@ -357,6 +360,18 @@ def check_verdict(
     return {"verdict": verdict, "reason": reason.strip(), "evidence_ids": refs}
 
 
+RENDER_DOWNLOAD = _fn(
+    "render_download_page",
+    "Render one page of a PDF downloaded through the app. "
+    "Use the download_id from browser side effects and a 1-based page number.",
+    {
+        "download_id": {"type": "integer", "minimum": 1},
+        "page": {"type": "integer", "minimum": 1},
+    },
+    required=["download_id", "page"],
+)
+
+
 class RubricJudge(ProbeAgent):
     """Reuse the probe's browser dispatch; replace its findings loop with leaf verdicts."""
 
@@ -462,6 +477,7 @@ class RubricJudge(ProbeAgent):
         text = {
             "evidence_id": eid,
             "action": action,
+            "input": args,
             "success": record["success"],
             "outcome": outcome,
         }
@@ -643,6 +659,27 @@ class RubricJudge(ProbeAgent):
             self.usage[key] += getattr(usage, key, 0) or 0
         return response.choices[0].message
 
+    async def _render_download(self, args):
+        path, filename = await self._env.downloaded_file(args["download_id"])
+        data = await asyncio.to_thread(render_pdf_page, path, args["page"])
+        eid = f"e{len(self.evidence):04d}"
+        self.evidence_dir.mkdir(parents=True, exist_ok=True)
+        (self.evidence_dir / f"{eid}.png").write_bytes(data)
+        record = {
+            "id": eid,
+            "action": "render_download_page",
+            "input": args,
+            "outcome": {"filename": filename, "page": args["page"]},
+            "success": True,
+            "screenshot": f"evidence/{eid}.png",
+        }
+        (self.evidence_dir / f"{eid}.json").write_text(
+            json.dumps(record, ensure_ascii=False)
+        )
+        self.evidence.append(record)
+        self._emit({"kind": "evidence", "id": eid, "path": f"evidence/{eid}.json"})
+        return self._read_evidence({"evidence_id": eid})
+
     def _record(self, args: dict, leaves: dict[str, dict], step: int) -> str:
         items = args.get("verdicts")
         if not isinstance(items, list) or not items:
@@ -706,7 +743,9 @@ class RubricJudge(ProbeAgent):
             choice = {"type": "function", "function": {"name": "record_verdicts"}}
         else:
             tools = (
-                BROWSER_TOOLS + SOURCE_TOOLS + [EVIDENCE_TOOL, RECORD_TOOL, FINISH_TOOL]
+                BROWSER_TOOLS
+                + SOURCE_TOOLS
+                + [RENDER_DOWNLOAD, EVIDENCE_TOOL, RECORD_TOOL, FINISH_TOOL]
             )
             choice = "auto"
         msg = await self._request(client, messages, tools, choice)
@@ -744,6 +783,15 @@ class RubricJudge(ProbeAgent):
                 elif name == "finish":
                     self.summary = str(args.get("summary") or "")
                     finished, reply = True, "Finished."
+                elif name == "render_download_page":
+                    remaining = self._exploration_deadline_at - time.monotonic()
+                    try:
+                        async with asyncio.timeout(min(30, remaining)):
+                            observations.extend(await self._render_download(args))
+                    except Exception as exc:
+                        reply = f"PDF page unavailable: {type(exc).__name__}: {exc}"
+                    else:
+                        reply = f"Rendered page in {self.evidence[-1]['id']}."
                 elif name == "read_evidence":
                     observations.extend(self._read_evidence(args))
                     reply = f"Retrieved historical evidence {args['evidence_id']}. Browser unchanged."

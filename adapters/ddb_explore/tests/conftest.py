@@ -17,5 +17,6 @@ except ImportError:
     api = types.ModuleType("playwright.async_api")
     for name in ("async_playwright", "Page", "Browser", "BrowserContext"):
         setattr(api, name, object)
+    api.Error = type("PlaywrightError", (Exception,), {})
     sys.modules["playwright"] = types.ModuleType("playwright")
     sys.modules["playwright.async_api"] = api

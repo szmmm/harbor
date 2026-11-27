@@ -178,6 +178,7 @@ class PlaywrightEnv:
         # Page-invisible side effects (download / file chooser / dialog /
         # popup). Read incrementally via ``drain_side_effects`` so a caller can
         # attribute them to the action that just ran.
+        self._downloads: list[Any] = []
         self._side_effects: list[dict[str, Any]] = []
         self._side_effects_taken: int = 0
         # A file the next file chooser should receive. Set by
@@ -1106,8 +1107,9 @@ class PlaywrightEnv:
             # A download is the clearest case of a side effect the DOM cannot
             # show: Chromium streams the file and the page stays byte-identical.
             try:
+                self._downloads.append(download)
                 self._note_side_effect(
-                    "download",
+                    "download", download_id=len(self._downloads),
                     suggested_filename=str(
                         getattr(download, "suggested_filename", "") or ""),
                     url=_truncate(str(getattr(download, "url", "") or ""), 300),
@@ -1187,6 +1189,15 @@ class PlaywrightEnv:
             page.on("popup", _on_popup)
         except Exception as e:  # noqa: BLE001
             logger.warning("failed to attach runtime listeners: %s", e)
+
+    async def downloaded_file(self, download_id: int) -> tuple[Path, str]:
+        if type(download_id) is not int or not 1 <= download_id <= len(self._downloads):
+            raise ValueError("use a download_id from a recorded browser download")
+        download = self._downloads[download_id - 1]
+        path = await download.path()
+        if path is None:
+            raise ValueError("download did not complete")
+        return Path(path), download.suggested_filename
 
     def _note_side_effect(self, kind: str, **fields: Any) -> None:
         if len(self._side_effects) >= MAX_SIDE_EFFECTS:

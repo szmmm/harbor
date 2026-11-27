@@ -26,6 +26,7 @@ The judge has more tools for leaves that the screen alone cannot decide:
 
 - `set_viewport`: window size and full-screen checks.
 - `set_media`: print CSS, for print checks.
+- `render_download_page` rasterizes a page of an actual browser PDF download by download ID. The saved PNG records the filename and page number in its evidence record.
 - `clear_site_data`: delete cookies and browser storage, then reload. It acts
   as a new browser or device, for checks that data is stored on a server.
 - `list_source_files`, `read_source_file`, `search_source`: read-only access
