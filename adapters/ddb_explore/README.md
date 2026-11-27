@@ -14,8 +14,8 @@ scoring is optional and lives in `test_trajectory.py`; setting
 From the Harbor repository root:
 
 ```bash
-bash adapters/ddb_explore/generate_dataset.sh \
-  --rubrics /mnt/workspace/liurenxi3/szm/rubrics-tree-generation/runs/dsv4-rand100-max-t1/rubrics.jsonl
+GLM_RUBRICS=/mnt/data/liurenxi3/szm/rubrics-tree-generation/runs/glm53-attractive-rand100-with-nov09-corrections-20261126/rubrics.jsonl
+bash adapters/ddb_explore/generate_dataset.sh --rubrics "$GLM_RUBRICS" --overwrite
 
 bash adapters/ddb_explore/run_ddb_explore.sh
 ```
@@ -24,7 +24,9 @@ Tasks are written to `datasets/ddb-explore`. The script also writes the slime
 prompt data to `datasets/ddb-explore.prompts.jsonl`: one row
 `{"instruction": ..., "metadata": {"task_id": ...}}` per task, where `task_id`
 is the task's directory name. Use `--limit 5` for a smaller dataset and
-`--overwrite` to write the tasks again. The script uses `uv` when it is
+`--overwrite` to replace existing tasks when the input rubrics change. Without
+that flag, matching tasks are reused and a mismatch stops generation.
+The script uses `uv` when it is
 installed, and `.venv/bin/python` when it is not.
 
 On h20 and h20-2, Docker Hub is not reachable. Add `--registry-mirror

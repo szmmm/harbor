@@ -62,6 +62,28 @@ class RubricAdapter(ExploreAdapter[RubricTask]):
     default_device = PHONE
 
     @override
+    def generate_task(self, task_id: str, *, overwrite: bool = False) -> Path | None:
+        task_dir = self.output_dir / f"{self.task_prefix}-{to_safe_id(task_id)}"
+        if task_dir.exists() and not overwrite:
+            paths = TaskPaths(task_dir=task_dir)
+            record = self.dataset.get(task_id)
+            try:
+                matches = (
+                    paths.instruction_path.read_text(encoding="utf-8") == record.instruction
+                    and json.loads(
+                        (paths.tests_dir / "rubric.json").read_text(encoding="utf-8")
+                    ) == record.rubric
+                )
+            except (OSError, ValueError):
+                matches = False
+            if not matches:
+                raise ValueError(
+                    f"Existing task {task_dir} differs from the input or is incomplete. "
+                    "Use --overwrite or a new output directory."
+                )
+        return super().generate_task(task_id, overwrite=overwrite)
+
+    @override
     def _device(self, record: RubricTask) -> str:
         delivery = (record.rubric.get("spec") or {}).get("delivery")
         return DELIVERY_DEVICES.get(delivery, self.default_device)
